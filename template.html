@@ -28,7 +28,8 @@ header .meta { color: var(--muted); font-size: 13px; }
 .controls { margin-bottom:16px; display:flex; gap:10px; }
 .controls input, .controls select { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:8px 12px; border-radius:6px; font-size:13px; }
 .controls input { flex:1; max-width:320px; }
-.plant-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(360px,1fr)); gap:14px; }
+.plant-grid { display:flex; flex-direction:column; gap:14px; }
+.plant-row { display:grid; gap:14px; align-items:start; }
 .plant-card { background: var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
 .plant-head { padding:14px 16px; cursor:pointer; display:flex; justify-content:space-between; align-items:flex-start; }
 .plant-head:hover { background: var(--panel2); }
@@ -59,6 +60,10 @@ th { color:var(--muted); font-weight:normal; }
 .eq-item .eq-val { font-weight:bold; margin-top:2px; }
 .btn { background: var(--panel2); border:1px solid var(--border); color: var(--text); padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
 .btn:hover { background: var(--border); }
+.pv-compare { margin-top:14px; padding-top:10px; border-top:1px dashed var(--border); }
+.pv-compare table { font-size:11.5px; }
+.pv-note { font-size:10.5px; color:var(--muted); margin-top:6px; line-height:1.5; }
+.sort-note { font-size:11.5px; color:var(--muted); margin: -6px 0 14px 0; }
 </style>
 </head>
 <body>
@@ -81,6 +86,7 @@ th { color:var(--muted); font-weight:normal; }
   <div class="summary" id="summaryCards"></div>
 
   <div class="section-title">&#9888;&#65039; จุดที่ควรตรวจสอบ</div>
+  <div class="sort-note">ผลผลิตต่ำผิดปกติ: ย้อนหลัง 3 วันล่าสุด · ปัญหา inverter/อุณหภูมิ: สถานะปัจจุบัน (ไม่จำกัดวัน)</div>
   <div id="attentionList"></div>
 
   <div class="section-title">&#128276; Alarms (5 วันล่าสุด)</div>
@@ -99,6 +105,7 @@ th { color:var(--muted); font-weight:normal; }
       <option value="anom">มีจุดที่ควรตรวจสอบ</option>
     </select>
   </div>
+  <div class="sort-note">เรียงตามวันที่เชื่อมกริดล่าสุดก่อนเสมอ — สถานีที่มีจุดควรตรวจสอบหรือสถานะผิดปกติจะถูกดันขึ้นบนสุดเสมอ</div>
   <div class="plant-grid" id="plantGrid"></div>
 </div>
 
@@ -151,118 +158,211 @@ const charts = {};
 
 function healthLabel(h) { return h===3 ? '<span class="badge badge-good">ปกติ</span>' : `<span class="badge badge-bad">${h===1?'Disconnected':h===2?'Faulty':'ไม่ทราบ'}</span>`; }
 
-function renderCard(p) {
-  const div = document.createElement('div');
-  div.className = 'plant-card';
-  div.dataset.name = (p.plantName+p.plantCode).toLowerCase();
-  div.dataset.health = p.health_state===3 ? 'ok':'bad';
-  div.dataset.anom = (p.anomalies&&p.anomalies.length) ? 'anom' : '';
-
-  const wIcon = ICONS[p.today_weather_symbol] || ICONS['?'];
-  div.innerHTML = `
-    <div class="plant-head" onclick="toggleCard('${p.plantCode}')">
-      <div>
-        <div class="plant-name">${p.plantName}</div>
-        <div class="plant-sub">${fmt(p.capacity_kwp,2)} kWp · ${p.inverters.length} inverter(s)</div>
-        <div>
-          ${p.equipment.has_optimizer?`<span class="eq-chip">Optimizer x${p.equipment.optimizer_count}</span>`:''}
-          ${p.equipment.has_battery?`<span class="eq-chip">Battery ${fmt(p.equipment.battery_total_kwh,0)}kWh</span>`:''}
-          ${p.equipment.has_smartguard?`<span class="eq-chip">Smart Guard</span>`:''}
-        </div>
-        ${(p.anomalies&&p.anomalies.length)?`<span class="anom-tag">${p.anomalies.length} จุดควรตรวจสอบ</span>`:''}
-      </div>
-      <div style="text-align:right">
-        ${healthLabel(p.health_state)}
-        <div style="font-size:20px;margin-top:4px">${wIcon}</div>
-      </div>
-    </div>
-    <div class="plant-body" id="body-${p.plantCode}">
-      <div class="stat-row">
-        <div><span>กำลังผลิตตอนนี้</span>${fmt(p.power_now_kw,2)} kW</div>
-        <div><span>พลังงานวันนี้</span>${fmt(p.day_energy_kwh,1)} kWh</div>
-        <div><span>ใช้ไฟวันนี้</span>${fmt(p.day_use_kwh,1)} kWh</div>
-        <div><span>ขายเข้ากริดวันนี้</span>${fmt(p.day_ongrid_kwh,1)} kWh</div>
-        <div><span>พลังงานเดือนนี้</span>${fmt(p.month_energy_kwh,1)} kWh</div>
-      </div>
-      <div class="small-muted">เชื่อมกริด: ${(p.gridConnectionDate||'').substring(0,10)}</div>
-
-      <div class="inv-title" style="margin-top:14px">&#128268; อุปกรณ์ที่ติดตั้ง</div>
-      <div class="eq-grid">
-        <div class="eq-item"><div class="eq-lbl">Inverter</div><div class="eq-val">${p.equipment.inverter_models.join(', ')||'-'}</div></div>
-        <div class="eq-item"><div class="eq-lbl">Optimizer</div><div class="eq-val">${p.equipment.has_optimizer?('มี x'+p.equipment.optimizer_count+' ('+(p.equipment.optimizer_model||'-')+')'):'ไม่มี'}</div></div>
-        <div class="eq-item"><div class="eq-lbl">Battery</div><div class="eq-val">${p.equipment.has_battery?('มี '+fmt(p.equipment.battery_total_kwh,0)+' kWh ('+(p.equipment.battery_model||'-')+')'):'ไม่มี'}</div></div>
-        <div class="eq-item"><div class="eq-lbl">Smart Guard</div><div class="eq-val">${p.equipment.has_smartguard?'มี':'ไม่มี'}</div></div>
-        <div class="eq-item"><div class="eq-lbl">Meter</div><div class="eq-val">${p.equipment.meter_count} ตัว</div></div>
-      </div>
-
-      <div class="weather-strip">
-        ${p.trend_10d.map(t=>`<div class="wchip"><div class="ic">${ICONS[t.weather_symbol]||ICONS['?']}</div>${t.date.substring(5)}<br>${t.precip_mm!==null&&t.precip_mm>0?t.precip_mm+'mm':''}</div>`).join('')}
-      </div>
-
-      <canvas id="chart-${p.plantCode}"></canvas>
-
-      ${p.inverters.map(inv => `
-        <div class="inv-block">
-          <div class="inv-title">Inverter ${inv.sn} — ${inv.model||'-'}${inv.capacity_kw?(' ('+inv.capacity_kw+' kW)'):''} — ${fmt(inv.active_power_kw,2)} kW now, ${fmt(inv.temperature_c,0)}&deg;C, ${fmt(inv.day_energy_kwh,1)} kWh วันนี้</div>
-          <table>
-            <tr>${inv.strings.map(s=>`<th>${s.string}</th>`).join('')}</tr>
-            <tr>${inv.strings.map(s=>`<td>${fmt(s.voltage_v,1)}V / ${fmt(s.current_a,2)}A</td>`).join('')}</tr>
-          </table>
-        </div>
-      `).join('')}
-    </div>
-  `;
-  grid.appendChild(div);
+function batteryChipText(eq) {
+  if (!eq.has_battery) return '';
+  if (eq.battery_count > 1 && eq.battery_unit_kwh) return `${eq.battery_count}×${fmt(eq.battery_unit_kwh,0)}kWh`;
+  return `${fmt(eq.battery_total_kwh,0)}kWh`;
 }
-
-plants.forEach(renderCard);
-
-function toggleCard(code) {
-  const body = document.getElementById('body-'+code);
-  const wasOpen = body.classList.contains('open');
-  body.classList.toggle('open');
-  if (!wasOpen && !charts[code]) {
-    const p = plants.find(x=>x.plantCode===code);
-    const ctx = document.getElementById('chart-'+code);
-    charts[code] = new Chart(ctx, {
-      type: 'bar',
-      data: {
-        labels: p.trend_10d.map(t=>t.date.substring(5)),
-        datasets: [{ label: 'ผลผลิต (kWh/วัน)', data: p.trend_10d.map(t=>t.power_kwh), backgroundColor: '#3ba7ff' }]
-      },
-      options: {
-        responsive: true,
-        plugins: { legend: { labels: { color: '#8b9bab' } } },
-        scales: {
-          x: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } },
-          y: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } }
-        }
-      }
-    });
+function batteryDetailText(eq) {
+  if (!eq.has_battery) return 'ไม่มี';
+  if (eq.battery_unit_kwh) {
+    return `${eq.battery_count} ก้อน × ${fmt(eq.battery_unit_kwh,0)}kWh (รวม ${fmt(eq.battery_total_kwh,0)} kWh) — ${eq.battery_model||'-'}`;
   }
+  return `มี ${fmt(eq.battery_total_kwh,0)} kWh (${eq.battery_model||'-'})`;
 }
 
-function collapseAll() {
-  document.querySelectorAll('.plant-body').forEach(b => b.classList.remove('open'));
+// PV1/PV2 daily-max comparison: union the dates seen across both strings so
+// the table stays aligned even if one string has fewer days of history yet.
+function pvUnionDates(inv) {
+  const set = new Set();
+  ((inv.pv_trend_5d&&inv.pv_trend_5d.PV1)||[]).forEach(x=>set.add(x.date));
+  ((inv.pv_trend_5d&&inv.pv_trend_5d.PV2)||[]).forEach(x=>set.add(x.date));
+  return Array.from(set).sort();
 }
-function expandAll() {
-  document.querySelectorAll('.plant-body').forEach(b => {
-    if (!b.classList.contains('open')) {
-      const code = b.id.replace('body-','');
-      b.classList.add('open');
-      if (!charts[code]) {
-        const p = plants.find(x=>x.plantCode===code);
-        const ctx = document.getElementById('chart-'+code);
-        charts[code] = new Chart(ctx, {
-          type: 'bar',
-          data: { labels: p.trend_10d.map(t=>t.date.substring(5)),
-            datasets: [{ label: 'ผลผลิต (kWh/วัน)', data: p.trend_10d.map(t=>t.power_kwh), backgroundColor: '#3ba7ff' }] },
-          options: { responsive: true, plugins: { legend: { labels: { color: '#8b9bab' } } },
-            scales: { x: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } }, y: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } } } }
-        });
+function pvRowCells(inv, key, dates) {
+  const map = {};
+  ((inv.pv_trend_5d&&inv.pv_trend_5d[key])||[]).forEach(x=>map[x.date]=x.max_power_w);
+  return dates.map(d=>`<td>${map[d]!==undefined?fmt(map[d],0):'-'}</td>`).join('');
+}
+function pvCompareHtml(inv) {
+  const dates = pvUnionDates(inv);
+  if (!dates.length) return '';
+  return `
+    <div class="pv-compare">
+      <div class="small-muted" style="margin-bottom:4px;">&#9889; เปรียบเทียบกำลังผลิตสูงสุดต่อวัน (W) — PV1 vs PV2, ${dates.length} วันล่าสุด</div>
+      <table>
+        <tr><th></th>${dates.map(d=>`<th>${d.substring(5)}</th>`).join('')}</tr>
+        <tr><td>PV1</td>${pvRowCells(inv,'PV1',dates)}</tr>
+        <tr><td>PV2</td>${pvRowCells(inv,'PV2',dates)}</tr>
+      </table>
+      <div class="pv-note">ค่าสูงสุดที่วัดได้ในแต่ละวัน สะสมจากการรีเฟรชทุก 15-30 นาที (Northbound API ไม่มีข้อมูลย้อนหลังระดับ PV string ต้องสะสมเอง — ถ้า PV ก้อนไหนกำลังลดลงเรื่อยๆ เทียบกับอีกก้อน อาจบ่งบอกสายหลวม/breaker ร้อนหรือทริป ควรตรวจสอบ)</div>
+    </div>`;
+}
+
+function cardHtml(p, rowIndex) {
+  const wIcon = ICONS[p.today_weather_symbol] || ICONS['?'];
+  return `
+    <div class="plant-card" data-code="${p.plantCode}" data-name="${(p.plantName+p.plantCode).toLowerCase()}" data-health="${p.health_state===3?'ok':'bad'}" data-anom="${(p.anomalies&&p.anomalies.length)?'anom':''}">
+      <div class="plant-head" onclick="toggleRow(${rowIndex})">
+        <div>
+          <div class="plant-name">${p.plantName}</div>
+          <div class="plant-sub">${fmt(p.capacity_kwp,2)} kWp · ${p.inverters.length} inverter(s)</div>
+          <div>
+            ${p.equipment.has_optimizer?`<span class="eq-chip">Optimizer x${p.equipment.optimizer_count}</span>`:''}
+            ${p.equipment.has_battery?`<span class="eq-chip">Battery ${batteryChipText(p.equipment)}</span>`:''}
+            ${p.equipment.has_smartguard?`<span class="eq-chip">Smart Guard</span>`:''}
+          </div>
+          ${(p.anomalies&&p.anomalies.length)?`<span class="anom-tag">${p.anomalies.length} จุดควรตรวจสอบ</span>`:''}
+        </div>
+        <div style="text-align:right">
+          ${healthLabel(p.health_state)}
+          <div style="font-size:20px;margin-top:4px">${wIcon}</div>
+        </div>
+      </div>
+      <div class="plant-body" id="body-${p.plantCode}">
+        <div class="stat-row">
+          <div><span>กำลังผลิตตอนนี้</span>${fmt(p.power_now_kw,2)} kW</div>
+          <div><span>พลังงานวันนี้</span>${fmt(p.day_energy_kwh,1)} kWh</div>
+          <div><span>ใช้ไฟวันนี้</span>${fmt(p.day_use_kwh,1)} kWh</div>
+          <div><span>ขายเข้ากริดวันนี้</span>${fmt(p.day_ongrid_kwh,1)} kWh</div>
+          <div><span>พลังงานเดือนนี้</span>${fmt(p.month_energy_kwh,1)} kWh</div>
+        </div>
+        <div class="small-muted">เชื่อมกริด: ${(p.gridConnectionDate||'').substring(0,10)}</div>
+
+        <div class="inv-title" style="margin-top:14px">&#128268; อุปกรณ์ที่ติดตั้ง</div>
+        <div class="eq-grid">
+          <div class="eq-item"><div class="eq-lbl">Inverter</div><div class="eq-val">${p.equipment.inverter_models.join(', ')||'-'}</div></div>
+          <div class="eq-item"><div class="eq-lbl">Optimizer</div><div class="eq-val">${p.equipment.has_optimizer?('มี x'+p.equipment.optimizer_count+' ('+(p.equipment.optimizer_model||'-')+')'):'ไม่มี'}</div></div>
+          <div class="eq-item"><div class="eq-lbl">Battery</div><div class="eq-val">${batteryDetailText(p.equipment)}</div></div>
+          <div class="eq-item"><div class="eq-lbl">Smart Guard</div><div class="eq-val">${p.equipment.has_smartguard?'มี':'ไม่มี'}</div></div>
+          <div class="eq-item"><div class="eq-lbl">Meter</div><div class="eq-val">${p.equipment.meter_count} ตัว</div></div>
+        </div>
+
+        <div class="weather-strip">
+          ${p.trend_10d.map(t=>`<div class="wchip"><div class="ic">${ICONS[t.weather_symbol]||ICONS['?']}</div>${t.date.substring(5)}<br>${t.precip_mm!==null&&t.precip_mm>0?t.precip_mm+'mm':''}</div>`).join('')}
+        </div>
+
+        <canvas id="chart-${p.plantCode}"></canvas>
+
+        ${p.inverters.map(inv => `
+          <div class="inv-block">
+            <div class="inv-title">Inverter ${inv.sn} — ${inv.model||'-'}${inv.capacity_kw?(' ('+inv.capacity_kw+' kW)'):''} — ${fmt(inv.active_power_kw,2)} kW now, ${fmt(inv.temperature_c,0)}&deg;C, ${fmt(inv.day_energy_kwh,1)} kWh วันนี้</div>
+            <table>
+              <tr>${inv.strings.map(s=>`<th>${s.string}</th>`).join('')}</tr>
+              <tr>${inv.strings.map(s=>`<td>${fmt(s.voltage_v,1)}V / ${fmt(s.current_a,2)}A</td>`).join('')}</tr>
+            </table>
+            ${pvCompareHtml(inv)}
+          </div>
+        `).join('')}
+      </div>
+    </div>`;
+}
+
+function makeChart(code) {
+  const p = plants.find(x=>x.plantCode===code);
+  const ctx = document.getElementById('chart-'+code);
+  if (!ctx) return null;
+  return new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: p.trend_10d.map(t=>t.date.substring(5)),
+      datasets: [{ label: 'ผลผลิต (kWh/วัน)', data: p.trend_10d.map(t=>t.power_kwh), backgroundColor: '#3ba7ff' }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: '#8b9bab' } } },
+      scales: {
+        x: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } },
+        y: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } }
       }
     }
   });
+}
+function ensureChart(code) {
+  if (charts[code]) return;
+  const c = makeChart(code);
+  if (c) charts[code] = c;
+}
+function destroyAllCharts() {
+  Object.values(charts).forEach(c => c.destroy());
+  Object.keys(charts).forEach(k => delete charts[k]);
+}
+
+// --- sorting: grid-connection-date descending, with any flagged (unhealthy
+// or has an active "needs attention" item) plant always pinned to the top ---
+let sortedPlants = [];
+function sortPlants() {
+  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
+  sortedPlants = plants.slice().sort((a, b) => {
+    const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
+    if (af !== bf) return bf - af;
+    const ad = a.gridConnectionDate || '', bd = b.gridConnectionDate || '';
+    return bd.localeCompare(ad);
+  });
+}
+
+// --- row-grouped grid: cards are grouped into explicit "row" wrapper divs so
+// that expanding/collapsing any card in a row expands/collapses every card
+// in that same visual row together. Row membership is recomputed on resize. ---
+let rowsOfCodes = [];
+let openCodes = new Set();
+let lastCols = 0;
+
+function computeCols() {
+  const w = grid.clientWidth || window.innerWidth;
+  const minW = 360, gap = 14;
+  return Math.max(1, Math.floor((w + gap) / (minW + gap)));
+}
+
+function renderGrid() {
+  destroyAllCharts();
+  sortPlants();
+  const cols = computeCols();
+  lastCols = cols;
+  rowsOfCodes = [];
+  grid.innerHTML = '';
+  for (let i = 0; i < sortedPlants.length; i += cols) {
+    const rowPlants = sortedPlants.slice(i, i + cols);
+    const rowIndex = rowsOfCodes.length;
+    rowsOfCodes.push(rowPlants.map(p => p.plantCode));
+    const rowDiv = document.createElement('div');
+    rowDiv.className = 'plant-row';
+    rowDiv.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    rowDiv.innerHTML = rowPlants.map(p => cardHtml(p, rowIndex)).join('');
+    grid.appendChild(rowDiv);
+  }
+  applyOpenState();
+  applyFilters();
+}
+
+function applyOpenState() {
+  rowsOfCodes.forEach(codes => {
+    const isOpen = codes.length > 0 && codes.every(c => openCodes.has(c));
+    codes.forEach(c => {
+      const body = document.getElementById('body-' + c);
+      if (!body) return;
+      if (isOpen) { body.classList.add('open'); ensureChart(c); }
+      else { body.classList.remove('open'); }
+    });
+  });
+}
+
+function toggleRow(rowIndex) {
+  const codes = rowsOfCodes[rowIndex];
+  if (!codes) return;
+  const isOpen = codes.every(c => openCodes.has(c));
+  if (isOpen) { codes.forEach(c => openCodes.delete(c)); }
+  else { codes.forEach(c => openCodes.add(c)); }
+  applyOpenState();
+}
+
+function collapseAll() {
+  openCodes.clear();
+  applyOpenState();
+}
+function expandAll() {
+  sortedPlants.forEach(p => openCodes.add(p.plantCode));
+  applyOpenState();
 }
 
 function applyFilters() {
@@ -279,6 +379,16 @@ function applyFilters() {
 document.getElementById('searchBox').addEventListener('input', applyFilters);
 document.getElementById('filterHealth').addEventListener('change', applyFilters);
 document.getElementById('filterAnom').addEventListener('change', applyFilters);
+
+renderGrid();
+
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (computeCols() !== lastCols) renderGrid();
+  }, 200);
+});
 </script>
 </body>
 </html>

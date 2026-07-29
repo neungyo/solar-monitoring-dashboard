@@ -120,6 +120,14 @@ def touch(path):
 
 def main():
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+    today_str = now.strftime("%Y-%m-%d")
+    anomaly_cutoff_date = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+
+    # PV1/PV2 daily-max power history — persists across runs (see note below
+    # where it's populated). Pruned to a small rolling window on every save.
+    PV_MAX_PATH = "data/pv_daily_max.json"
+    pv_daily_max = load_json(PV_MAX_PATH, {})
+
     login()
 
     # ---- asset data: refresh at most every 12h (Huawei daily-quota endpoints) ----
@@ -248,21 +256,47 @@ def main():
             for t, dstr in zip(dev_last10, dev_dates10):
                 item = dd.get(t, {})
                 inv_trend.append({"date": dstr, "power_kwh": item.get("product_power"), "perf_ratio": item.get("perpower_ratio")})
+
+            # PV1/PV2 daily-max power tracking. The Northbound API has no
+            # historical string-level endpoint (only real-time pv{i}_u/pv{i}_i),
+            # so we build our own rolling history by snapshotting the max
+            # instantaneous power seen on each calendar day across runs
+            # (this script runs every 15-30 min via GitHub Actions, and
+            # data/pv_daily_max.json persists across runs in the repo).
+            sn = inv.get("esnCode")
+            pv_trend_5d = {}
+            for i in (1, 2):
+                u = real_kpi.get(f"pv{i}_u")
+                ii = real_kpi.get(f"pv{i}_i")
+                key = f"{code}|{sn}|PV{i}"
+                if u is not None and ii is not None:
+                    power_w = round(u * ii, 1)
+                    day_map = pv_daily_max.setdefault(key, {})
+                    if day_map.get(today_str) is None or power_w > day_map[today_str]:
+                        day_map[today_str] = power_w
+                day_map = pv_daily_max.get(key, {})
+                last5 = sorted(day_map.keys())[-5:]
+                pv_trend_5d[f"PV{i}"] = [{"date": d, "max_power_w": day_map[d]} for d in last5]
+
             inv_out.append({
-                "sn": inv.get("esnCode"), "model": inv.get("model"),
+                "sn": sn, "model": inv.get("model"),
                 "capacity_kw": parse_kw_from_model(inv.get("model")),
                 "optimizer_count": inv.get("optimizerNumber"),
                 "temperature_c": real_kpi.get("temperature"),
                 "active_power_kw": real_kpi.get("active_power"),
                 "day_energy_kwh": real_kpi.get("day_cap"),
                 "strings": strings, "trend_10d": inv_trend,
+                "pv_trend_5d": pv_trend_5d,
             })
 
         battery_total_kwh = 0.0
+        battery_unit_kwh = None
         battery_model = None
         for b in batteries:
             kwv = parse_kw_from_model(b.get("model"))
-            if kwv: battery_total_kwh += kwv
+            if kwv:
+                battery_total_kwh += kwv
+                battery_unit_kwh = kwv
             battery_model = b.get("model")
 
         equipment = {
@@ -272,6 +306,7 @@ def main():
             "optimizer_model": (optimizers[0].get("model") if optimizers else None),
             "has_battery": len(batteries) > 0, "battery_count": len(batteries),
             "battery_model": battery_model,
+            "battery_unit_kwh": battery_unit_kwh,
             "battery_total_kwh": battery_total_kwh if batteries else None,
             "has_smartguard": len(smartguards) > 0,
             "meter_count": len(meters),
@@ -288,6 +323,18 @@ def main():
             "trend_10d": trend, "inverters": inv_out, "equipment": equipment,
         })
 
+    # prune stale dates from the PV daily-max store, then persist it so the
+    # next run (15-30 min later) keeps building on this history
+    pv_keep_from = (now - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
+    for key in list(pv_daily_max.keys()):
+        day_map = pv_daily_max[key]
+        for d in list(day_map.keys()):
+            if d < pv_keep_from:
+                del day_map[d]
+        if not day_map:
+            del pv_daily_max[key]
+    save_json(PV_MAX_PATH, pv_daily_max)
+
     # anomaly detection
     for p in plants_out:
         anomalies = []
@@ -298,7 +345,7 @@ def main():
                 for t in p["trend_10d"]:
                     pw = t["power_kwh"]
                     if pw is None: continue
-                    if pw < med * 0.4 and t["weather_symbol"] not in ("rain", "storm", "drizzle"):
+                    if pw < med * 0.4 and t["weather_symbol"] not in ("rain", "storm", "drizzle") and t["date"] >= anomaly_cutoff_date:
                         anomalies.append({"date": t["date"], "type": "production_dip",
                             "detail": f"ผลผลิต {pw:.1f} kWh ต่ำกว่าค่ามัธยฐาน ({med:.1f} kWh) มากกว่า 60% ทั้งที่สภาพอากาศ ({t['weather_label']}) ไม่ได้แย่ — ควรตรวจสอบ"})
         invs = p["inverters"]
