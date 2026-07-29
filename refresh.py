@@ -118,15 +118,62 @@ def stale(path, seconds):
 def touch(path):
     save_json(path, datetime.datetime.utcnow().isoformat())
 
+LIVE_PAGE_URL = "https://neungyo.github.io/solar-monitoring-dashboard/"
+
+def fetch_live_pv_daily_max():
+    """Rebuild the PV1/PV2 daily-peak history dict from whatever is already
+    embedded in the currently-deployed page.
+
+    IMPORTANT CONTEXT: this script runs inside a fresh, throwaway sandbox
+    every scheduled run (a Cowork scheduled task, not GitHub Actions — that
+    path is blocked by Huawei's geo-restricted DNS, see .github/workflows,
+    disabled). Only index.html gets uploaded back to the repo each run; a
+    local data/*.json file written during the run does NOT survive to the
+    next run. A prior version of this script assumed data/pv_daily_max.json
+    would persist across runs (it doesn't — every run silently started from
+    an empty {}, so the "5-day PV history" never actually accumulated past
+    a single day, always showing 0.0/0.00). Fix: treat the live page itself
+    as the persistence layer — it already round-trips through GitHub every
+    run, so read back the pv_trend_5d we embedded last time and seed today's
+    dict from it before adding this run's new reading.
+    """
+    result = {}
+    try:
+        req = urllib.request.Request(LIVE_PAGE_URL, headers={"Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r"const DATA = (.*?);\s*\nconst ICONS", html, re.S)
+        if not m:
+            return result
+        data = json.loads(m.group(1))
+        for p in data.get("plants", []):
+            code = p.get("plantCode")
+            for inv in p.get("inverters", []):
+                sn = inv.get("sn")
+                for pv_name, entries in (inv.get("pv_trend_5d") or {}).items():
+                    key = f"{code}|{sn}|{pv_name}"
+                    day_map = {}
+                    for e in entries:
+                        v = e.get("voltage_v")
+                        i = e.get("current_a")
+                        if v is None or i is None:
+                            continue
+                        day_map[e["date"]] = {"v": v, "i": i, "w": round(v * i, 1)}
+                    if day_map:
+                        result[key] = day_map
+    except Exception as e:
+        print(f"WARN: could not seed PV history from live page ({e}); starting fresh", file=sys.stderr)
+    return result
+
 def main():
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     today_str = now.strftime("%Y-%m-%d")
     anomaly_cutoff_date = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
 
-    # PV1/PV2 daily-max power history — persists across runs (see note below
-    # where it's populated). Pruned to a small rolling window on every save.
-    PV_MAX_PATH = "data/pv_daily_max.json"
-    pv_daily_max = load_json(PV_MAX_PATH, {})
+    # PV1/PV2 daily-max power history. Seeded from the live deployed page
+    # (see fetch_live_pv_daily_max) since this sandbox itself is thrown away
+    # after every run — data/pv_daily_max.json never survives to be reused.
+    pv_daily_max = fetch_live_pv_daily_max()
 
     login()
 
@@ -274,9 +321,12 @@ def main():
             # string-level V/A history exists anywhere in the Northbound
             # API. So we build our own rolling history by snapshotting each
             # string's V/A at the moment of highest output seen that
-            # calendar day, across runs (this script runs every 15-30 min
-            # via GitHub Actions, and data/pv_daily_max.json persists across
-            # runs in the repo, so ~5 days of real history accumulates).
+            # calendar day. This script runs hourly via a Cowork scheduled
+            # task (not GitHub Actions — blocked by Huawei's geo-DNS); each
+            # run is a fresh throwaway sandbox, so pv_daily_max is seeded at
+            # the top of main() from the live page's own embedded data
+            # (fetch_live_pv_daily_max) rather than a local file, letting
+            # ~5 days of real history accumulate across runs.
             sn = inv.get("esnCode")
             pv_trend_5d = {}
             for i in (1, 2):
@@ -355,17 +405,10 @@ def main():
             "trend_10d": trend, "inverters": inv_out, "equipment": equipment,
         })
 
-    # prune stale dates from the PV daily-max store, then persist it so the
-    # next run (15-30 min later) keeps building on this history
-    pv_keep_from = (now - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
-    for key in list(pv_daily_max.keys()):
-        day_map = pv_daily_max[key]
-        for d in list(day_map.keys()):
-            if d < pv_keep_from:
-                del day_map[d]
-        if not day_map:
-            del pv_daily_max[key]
-    save_json(PV_MAX_PATH, pv_daily_max)
+    # (pv_daily_max itself is scratch state for this run only — each
+    # inverter's pv_trend_5d was already sliced to the last 5 dates above,
+    # and no local file needs saving since the next run reseeds from the
+    # deployed index.html, not from disk.)
 
     # anomaly detection
     for p in plants_out:
