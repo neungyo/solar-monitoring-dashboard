@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>Solar Monitoring Dashboard — Synnex Thailand (Public)</title>
+<meta name="robots" content="noindex, nofollow">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0f1720; --panel: #16212c; --panel2: #1c2b38; --text: #e6edf3; --muted: #8b9bab;
+  --accent: #3ba7ff; --good: #2ecc71; --bad: #e74c3c; --warn: #f39c12; --border: #263544;
+}
+* { box-sizing: border-box; }
+body { margin:0; font-family: Arial, Helvetica, sans-serif; background: var(--bg); color: var(--text); }
+header { padding: 20px 28px; border-bottom: 1px solid var(--border); position: sticky; top:0; background: var(--bg); z-index: 10;}
+header h1 { margin: 0 0 4px 0; font-size: 22px; }
+header .meta { color: var(--muted); font-size: 13px; }
+.container { padding: 20px 28px; }
+.summary { display:flex; gap:14px; flex-wrap:wrap; margin-bottom: 22px; }
+.card { background: var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 18px; min-width:140px; }
+.card .num { font-size: 26px; font-weight:bold; }
+.card .lbl { font-size:12px; color: var(--muted); margin-top:2px;}
+.good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.section-title { font-size:16px; font-weight:bold; margin: 26px 0 10px 0; display:flex; align-items:center; gap:8px;}
+.note-box { background: var(--panel2); border-left:3px solid var(--accent); padding:12px 16px; border-radius:6px; font-size:13px; color: var(--muted); margin-bottom:16px; line-height:1.6;}
+.attention-item { background: var(--panel2); border-left:3px solid var(--warn); padding:10px 14px; border-radius:6px; margin-bottom:8px; font-size:13.5px; }
+.attention-item b { color: var(--warn); }
+.controls { margin-bottom:16px; display:flex; gap:10px; }
+.controls input, .controls select { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:8px 12px; border-radius:6px; font-size:13px; }
+.controls input { flex:1; max-width:320px; }
+.plant-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(360px,1fr)); gap:14px; }
+.plant-card { background: var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.plant-head { padding:14px 16px; cursor:pointer; display:flex; justify-content:space-between; align-items:flex-start; }
+.plant-head:hover { background: var(--panel2); }
+.plant-name { font-weight:bold; font-size:14px; }
+.plant-sub { color: var(--muted); font-size:12px; margin-top:3px; }
+.badge { padding: 3px 9px; border-radius:12px; font-size:11px; font-weight:bold; white-space:nowrap; }
+.badge-good { background: rgba(46,204,113,.15); color: var(--good); }
+.badge-bad { background: rgba(231,76,60,.15); color: var(--bad); }
+.plant-body { display:none; padding: 0 16px 16px 16px; border-top:1px solid var(--border); }
+.plant-body.open { display:block; }
+.stat-row { display:flex; flex-wrap:wrap; gap:18px; margin: 12px 0; font-size:12.5px; }
+.stat-row div span { display:block; color:var(--muted); font-size:11px; }
+.weather-strip { display:flex; gap:6px; margin: 10px 0; overflow-x:auto; }
+.wchip { text-align:center; font-size:10.5px; color:var(--muted); min-width:44px; }
+.wchip .ic { font-size:18px; }
+canvas { max-height:200px; }
+table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px;}
+th, td { padding:5px 7px; text-align:left; border-bottom:1px solid var(--border); }
+th { color:var(--muted); font-weight:normal; }
+.inv-block { margin-top:14px; padding-top:10px; border-top:1px dashed var(--border); }
+.inv-title { font-size:12.5px; font-weight:bold; margin-bottom:4px; }
+.small-muted { color:var(--muted); font-size:11px; }
+.anom-tag { display:inline-block; background: rgba(243,156,18,.15); color:var(--warn); font-size:10.5px; padding:2px 7px; border-radius:8px; margin-top:4px;}
+.eq-chip { display:inline-block; background: rgba(59,167,255,.12); color: var(--accent); font-size:10px; padding:2px 7px; border-radius:8px; margin: 4px 4px 0 0; }
+.eq-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap:10px; margin: 10px 0; }
+.eq-item { background: var(--panel2); border-radius:6px; padding:8px 10px; font-size:12px; }
+.eq-item .eq-lbl { color: var(--muted); font-size:10.5px; }
+.eq-item .eq-val { font-weight:bold; margin-top:2px; }
+.btn { background: var(--panel2); border:1px solid var(--border); color: var(--text); padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
+.btn:hover { background: var(--border); }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9728;&#65039; Solar Monitoring Dashboard — Synnex Thailand</h1>
+  <div class="meta" id="genMeta"></div>
+  <div style="margin-top:10px;">
+    <button class="btn" onclick="collapseAll()">&#8593; ย่อทั้งหมด</button>
+    <button class="btn" onclick="expandAll()">&#8595; ขยายทั้งหมด</button>
+  </div>
+</header>
+<div class="container">
+  <div class="note-box">
+    <b>เวอร์ชันสาธารณะ (Public)</b> — ตัดชื่อ (เหลือแค่ชื่อจริงบางส่วน), ที่อยู่, เบอร์โทร/อีเมลลูกค้า และพิกัด GPS ออกแล้ว เพื่อไม่ให้ข้อมูลส่วนบุคคลของลูกค้าเผยแพร่บนอินเทอร์เน็ตสาธารณะ<br>
+    ข้อมูลนี้ <b>อัปเดตอัตโนมัติทุก 15-30 นาที</b> ผ่าน GitHub Actions (ดึงสดจาก Huawei FusionSolar Northbound API) — แค่รีเฟรชหน้านี้ก็เห็นข้อมูลล่าสุดที่ระบบดึงมาได้เลย ไม่ต้องแจ้งในแชท<br>
+    ขอบเขต: เฉพาะ 37 สถานีของ Synnex Thailand ที่บัญชี API นี้เข้าถึงได้ — ยังไม่รวม shared plants (~30 สถานีที่เหลือจากทั้งหมด 67)<br>
+    ข้อจำกัดของ API: ข้อมูลระดับ PV string (PV1-8) แบบย้อนหลังรายวันไม่มีให้ผ่าน Northbound API — มีเฉพาะค่าปัจจุบัน (real-time) เท่านั้น ส่วนย้อนหลัง 10 วันระดับ string ใช้ค่า performance ของแต่ละ inverter แทน
+  </div>
+
+  <div class="summary" id="summaryCards"></div>
+
+  <div class="section-title">&#9888;&#65039; จุดที่ควรตรวจสอบ</div>
+  <div id="attentionList"></div>
+
+  <div class="section-title">&#128276; Alarms (5 วันล่าสุด)</div>
+  <div id="alarmsBox" class="note-box"></div>
+
+  <div class="section-title">&#127981;&#65039; รายชื่อสถานี (37 — Synnex Thailand)</div>
+  <div class="controls">
+    <input id="searchBox" placeholder="ค้นหา plant code...">
+    <select id="filterHealth">
+      <option value="">ทุกสถานะ</option>
+      <option value="ok">ปกติ</option>
+      <option value="bad">ผิดปกติ</option>
+    </select>
+    <select id="filterAnom">
+      <option value="">ทั้งหมด</option>
+      <option value="anom">มีจุดที่ควรตรวจสอบ</option>
+    </select>
+  </div>
+  <div class="plant-grid" id="plantGrid"></div>
+</div>
+
+<script>
+const DATA = __DATA_JSON__;
+const ICONS = __ICONS_JSON__;
+
+document.getElementById('genMeta').textContent = 'ดึงข้อมูลล่าสุด: ' + DATA.generated_at + ' (Bangkok time)';
+
+function fmt(n, d=1) { return (n===null||n===undefined||isNaN(n)) ? '-' : Number(n).toFixed(d); }
+
+const plants = DATA.plants;
+const totalCap = plants.reduce((s,p)=>s+(p.capacity_kwp||0),0);
+const healthy = plants.filter(p=>p.health_state===3).length;
+const bad = plants.length - healthy;
+const totalAnoms = plants.reduce((s,p)=>s+(p.anomalies?p.anomalies.length:0),0);
+
+document.getElementById('summaryCards').innerHTML = `
+  <div class="card"><div class="num">${plants.length}</div><div class="lbl">สถานี (Synnex Thailand)</div></div>
+  <div class="card"><div class="num">${fmt(totalCap,1)} kWp</div><div class="lbl">กำลังติดตั้งรวม</div></div>
+  <div class="card"><div class="num good">${healthy}</div><div class="lbl">สถานะปกติ</div></div>
+  <div class="card"><div class="num ${bad>0?'bad':''}">${bad}</div><div class="lbl">ผิดปกติ/ออฟไลน์</div></div>
+  <div class="card"><div class="num ${DATA.alarms_5day.length>0?'bad':'good'}">${DATA.alarms_5day.length}</div><div class="lbl">Alarm (5 วัน)</div></div>
+  <div class="card"><div class="num ${totalAnoms>0?'warn':'good'}">${totalAnoms}</div><div class="lbl">จุดที่ควรตรวจสอบ</div></div>
+`;
+
+const attnBox = document.getElementById('attentionList');
+let attnHtml = '';
+plants.forEach(p => {
+  (p.anomalies||[]).forEach(a => {
+    attnHtml += `<div class="attention-item"><b>${p.plantName}</b>${a.date?' — '+a.date:''}: ${a.detail}</div>`;
+  });
+});
+attnBox.innerHTML = attnHtml || '<div class="note-box">ไม่พบความผิดปกติที่เด่นชัดในช่วง 10 วันที่ผ่านมา</div>';
+
+const alarmsBox = document.getElementById('alarmsBox');
+if (DATA.alarms_5day.length === 0) {
+  alarmsBox.innerHTML = 'ไม่พบ alarm ใดๆ สำหรับทั้ง 37 สถานี ในช่วง 5 วันที่ผ่านมา';
+} else {
+  let t = '<table><tr><th>สถานี</th><th>ชื่อ Alarm</th><th>ระดับ</th><th>เวลาที่เกิด</th><th>สถานะ</th></tr>';
+  DATA.alarms_5day.forEach(a => {
+    t += `<tr><td>${a.stationCode||''}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${a.raiseTime||''}</td><td>${a.status||''}</td></tr>`;
+  });
+  t += '</table>';
+  alarmsBox.innerHTML = t;
+}
+
+const grid = document.getElementById('plantGrid');
+const charts = {};
+
+function healthLabel(h) { return h===3 ? '<span class="badge badge-good">ปกติ</span>' : `<span class="badge badge-bad">${h===1?'Disconnected':h===2?'Faulty':'ไม่ทราบ'}</span>`; }
+
+function renderCard(p) {
+  const div = document.createElement('div');
+  div.className = 'plant-card';
+  div.dataset.name = (p.plantName+p.plantCode).toLowerCase();
+  div.dataset.health = p.health_state===3 ? 'ok':'bad';
+  div.dataset.anom = (p.anomalies&&p.anomalies.length) ? 'anom' : '';
+
+  const wIcon = ICONS[p.today_weather_symbol] || ICONS['?'];
+  div.innerHTML = `
+    <div class="plant-head" onclick="toggleCard('${p.plantCode}')">
+      <div>
+        <div class="plant-name">${p.plantName}</div>
+        <div class="plant-sub">${fmt(p.capacity_kwp,2)} kWp · ${p.inverters.length} inverter(s)</div>
+        <div>
+          ${p.equipment.has_optimizer?`<span class="eq-chip">Optimizer x${p.equipment.optimizer_count}</span>`:''}
+          ${p.equipment.has_battery?`<span class="eq-chip">Battery ${fmt(p.equipment.battery_total_kwh,0)}kWh</span>`:''}
+          ${p.equipment.has_smartguard?`<span class="eq-chip">Smart Guard</span>`:''}
+        </div>
+        ${(p.anomalies&&p.anomalies.length)?`<span class="anom-tag">${p.anomalies.length} จุดควรตรวจสอบ</span>`:''}
+      </div>
+      <div style="text-align:right">
+        ${healthLabel(p.health_state)}
+        <div style="font-size:20px;margin-top:4px">${wIcon}</div>
+      </div>
+    </div>
+    <div class="plant-body" id="body-${p.plantCode}">
+      <div class="stat-row">
+        <div><span>กำลังผลิตตอนนี้</span>${fmt(p.power_now_kw,2)} kW</div>
+        <div><span>พลังงานวันนี้</span>${fmt(p.day_energy_kwh,1)} kWh</div>
+        <div><span>ใช้ไฟวันนี้</span>${fmt(p.day_use_kwh,1)} kWh</div>
+        <div><span>ขายเข้ากริดวันนี้</span>${fmt(p.day_ongrid_kwh,1)} kWh</div>
+        <div><span>พลังงานเดือนนี้</span>${fmt(p.month_energy_kwh,1)} kWh</div>
+      </div>
+      <div class="small-muted">เชื่อมกริด: ${(p.gridConnectionDate||'').substring(0,10)}</div>
+
+      <div class="inv-title" style="margin-top:14px">&#128268; อุปกรณ์ที่ติดตั้ง</div>
+      <div class="eq-grid">
+        <div class="eq-item"><div class="eq-lbl">Inverter</div><div class="eq-val">${p.equipment.inverter_models.join(', ')||'-'}</div></div>
+        <div class="eq-item"><div class="eq-lbl">Optimizer</div><div class="eq-val">${p.equipment.has_optimizer?('มี x'+p.equipment.optimizer_count+' ('+(p.equipment.optimizer_model||'-')+')'):'ไม่มี'}</div></div>
+        <div class="eq-item"><div class="eq-lbl">Battery</div><div class="eq-val">${p.equipment.has_battery?('มี '+fmt(p.equipment.battery_total_kwh,0)+' kWh ('+(p.equipment.battery_model||'-')+')'):'ไม่มี'}</div></div>
+        <div class="eq-item"><div class="eq-lbl">Smart Guard</div><div class="eq-val">${p.equipment.has_smartguard?'มี':'ไม่มี'}</div></div>
+        <div class="eq-item"><div class="eq-lbl">Meter</div><div class="eq-val">${p.equipment.meter_count} ตัว</div></div>
+      </div>
+
+      <div class="weather-strip">
+        ${p.trend_10d.map(t=>`<div class="wchip"><div class="ic">${ICONS[t.weather_symbol]||ICONS['?']}</div>${t.date.substring(5)}<br>${t.precip_mm!==null&&t.precip_mm>0?t.precip_mm+'mm':''}</div>`).join('')}
+      </div>
+
+      <canvas id="chart-${p.plantCode}"></canvas>
+
+      ${p.inverters.map(inv => `
+        <div class="inv-block">
+          <div class="inv-title">Inverter ${inv.sn} — ${inv.model||'-'}${inv.capacity_kw?(' ('+inv.capacity_kw+' kW)'):''} — ${fmt(inv.active_power_kw,2)} kW now, ${fmt(inv.temperature_c,0)}&deg;C, ${fmt(inv.day_energy_kwh,1)} kWh วันนี้</div>
+          <table>
+            <tr>${inv.strings.map(s=>`<th>${s.string}</th>`).join('')}</tr>
+            <tr>${inv.strings.map(s=>`<td>${fmt(s.voltage_v,1)}V / ${fmt(s.current_a,2)}A</td>`).join('')}</tr>
+          </table>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  grid.appendChild(div);
+}
+
+plants.forEach(renderCard);
+
+function toggleCard(code) {
+  const body = document.getElementById('body-'+code);
+  const wasOpen = body.classList.contains('open');
+  body.classList.toggle('open');
+  if (!wasOpen && !charts[code]) {
+    const p = plants.find(x=>x.plantCode===code);
+    const ctx = document.getElementById('chart-'+code);
+    charts[code] = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: p.trend_10d.map(t=>t.date.substring(5)),
+        datasets: [{ label: 'ผลผลิต (kWh/วัน)', data: p.trend_10d.map(t=>t.power_kwh), backgroundColor: '#3ba7ff' }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#8b9bab' } } },
+        scales: {
+          x: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } },
+          y: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } }
+        }
+      }
+    });
+  }
+}
+
+function collapseAll() {
+  document.querySelectorAll('.plant-body').forEach(b => b.classList.remove('open'));
+}
+function expandAll() {
+  document.querySelectorAll('.plant-body').forEach(b => {
+    if (!b.classList.contains('open')) {
+      const code = b.id.replace('body-','');
+      b.classList.add('open');
+      if (!charts[code]) {
+        const p = plants.find(x=>x.plantCode===code);
+        const ctx = document.getElementById('chart-'+code);
+        charts[code] = new Chart(ctx, {
+          type: 'bar',
+          data: { labels: p.trend_10d.map(t=>t.date.substring(5)),
+            datasets: [{ label: 'ผลผลิต (kWh/วัน)', data: p.trend_10d.map(t=>t.power_kwh), backgroundColor: '#3ba7ff' }] },
+          options: { responsive: true, plugins: { legend: { labels: { color: '#8b9bab' } } },
+            scales: { x: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } }, y: { ticks: { color: '#8b9bab' }, grid: { color:'#263544' } } } }
+        });
+      }
+    }
+  });
+}
+
+function applyFilters() {
+  const q = document.getElementById('searchBox').value.toLowerCase();
+  const h = document.getElementById('filterHealth').value;
+  const a = document.getElementById('filterAnom').value;
+  document.querySelectorAll('.plant-card').forEach(c => {
+    let show = c.dataset.name.includes(q);
+    if (h) show = show && c.dataset.health === h;
+    if (a) show = show && c.dataset.anom === a;
+    c.style.display = show ? '' : 'none';
+  });
+}
+document.getElementById('searchBox').addEventListener('input', applyFilters);
+document.getElementById('filterHealth').addEventListener('change', applyFilters);
+document.getElementById('filterAnom').addEventListener('change', applyFilters);
+</script>
+</body>
+</html>
