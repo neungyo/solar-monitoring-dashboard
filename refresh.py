@@ -145,6 +145,7 @@ def main():
     codes = ",".join(s["plantCode"] for s in stations)
     inv38 = [d["devDn"] for d in devlist if d["devTypeId"] == 38]
     inv1 = [d["devDn"] for d in devlist if d["devTypeId"] == 1]
+    bat39 = [d["devDn"] for d in devlist if d["devTypeId"] == 39]
 
     # ---- realtime data: every run ----
     realkpi = post("/thirdData/getStationRealKpi", {"stationCodes": codes})["data"]
@@ -153,6 +154,16 @@ def main():
         devreal += post("/thirdData/getDevRealKpi", {"devIds": ",".join(inv38), "devTypeId": 38})["data"]
     if inv1:
         devreal += post("/thirdData/getDevRealKpi", {"devIds": ",".join(inv1), "devTypeId": 1})["data"]
+
+    # battery real kpi: gives per-pack SN/SOH (battery_unit_info) and the
+    # current state of charge (battery_soc) — the devDn/devlist entry for a
+    # battery is just one logical "Battery-1" combiner even when 2+ physical
+    # packs are wired to it, so pack count has to come from here, not from
+    # counting devTypeId==39 rows.
+    bat_real_by_devid = {}
+    if bat39:
+        batreal = post("/thirdData/getDevRealKpi", {"devIds": ",".join(bat39), "devTypeId": 39})["data"]
+        bat_real_by_devid = {r["devId"]: r["dataItemMap"] for r in batreal}
 
     end = now
     start = end - datetime.timedelta(days=5)
@@ -257,12 +268,15 @@ def main():
                 item = dd.get(t, {})
                 inv_trend.append({"date": dstr, "power_kwh": item.get("product_power"), "perf_ratio": item.get("perpower_ratio")})
 
-            # PV1/PV2 daily-max power tracking. The Northbound API has no
-            # historical string-level endpoint (only real-time pv{i}_u/pv{i}_i),
-            # so we build our own rolling history by snapshotting the max
-            # instantaneous power seen on each calendar day across runs
-            # (this script runs every 15-30 min via GitHub Actions, and
-            # data/pv_daily_max.json persists across runs in the repo).
+            # PV1/PV2 daily voltage/current tracking. Confirmed against the
+            # live API: getDevKpiDay (the historical daily endpoint) only
+            # returns product_power/perpower_ratio for inverters — no
+            # string-level V/A history exists anywhere in the Northbound
+            # API. So we build our own rolling history by snapshotting each
+            # string's V/A at the moment of highest output seen that
+            # calendar day, across runs (this script runs every 15-30 min
+            # via GitHub Actions, and data/pv_daily_max.json persists across
+            # runs in the repo, so ~5 days of real history accumulates).
             sn = inv.get("esnCode")
             pv_trend_5d = {}
             for i in (1, 2):
@@ -272,11 +286,15 @@ def main():
                 if u is not None and ii is not None:
                     power_w = round(u * ii, 1)
                     day_map = pv_daily_max.setdefault(key, {})
-                    if day_map.get(today_str) is None or power_w > day_map[today_str]:
-                        day_map[today_str] = power_w
+                    cur = day_map.get(today_str)
+                    if cur is None or power_w > cur.get("w", -1):
+                        day_map[today_str] = {"v": round(u, 1), "i": round(ii, 2), "w": power_w}
                 day_map = pv_daily_max.get(key, {})
                 last5 = sorted(day_map.keys())[-5:]
-                pv_trend_5d[f"PV{i}"] = [{"date": d, "max_power_w": day_map[d]} for d in last5]
+                pv_trend_5d[f"PV{i}"] = [
+                    {"date": d, "voltage_v": day_map[d]["v"], "current_a": day_map[d]["i"]}
+                    for d in last5
+                ]
 
             inv_out.append({
                 "sn": sn, "model": inv.get("model"),
@@ -289,25 +307,39 @@ def main():
                 "pv_trend_5d": pv_trend_5d,
             })
 
-        battery_total_kwh = 0.0
-        battery_unit_kwh = None
+        # Battery: devlist only ever lists one logical "Battery-1" combiner
+        # device per station even when 2+ physical packs are wired to it, so
+        # the real pack count/SOH lives in getDevRealKpi's battery_unit_info
+        # (per-pack sn/soh, spread across unit1..unit4 sub-arrays with
+        # trailing null slots for empty bays). battery_soc is the live state
+        # of charge %.
+        battery_pack_count = 0
+        battery_soc_vals = []
         battery_model = None
         for b in batteries:
-            kwv = parse_kw_from_model(b.get("model"))
-            if kwv:
-                battery_total_kwh += kwv
-                battery_unit_kwh = kwv
+            bkpi = bat_real_by_devid.get(b["id"], {})
+            unit_info = bkpi.get("battery_unit_info") or {}
+            for arr in unit_info.values():
+                for item in (arr or []):
+                    if item and item.get("sn"):
+                        battery_pack_count += 1
+            soc = bkpi.get("battery_soc")
+            if soc is not None:
+                battery_soc_vals.append(soc)
             battery_model = b.get("model")
+        if batteries and battery_pack_count == 0:
+            battery_pack_count = len(batteries)  # fallback if unit_info wasn't reported
+        battery_soc_pct = round(sum(battery_soc_vals) / len(battery_soc_vals), 1) if battery_soc_vals else None
 
         equipment = {
             "inverter_count": len(inverters),
             "inverter_models": sorted(set(i.get("model") for i in inverters if i.get("model"))),
             "has_optimizer": len(optimizers) > 0, "optimizer_count": len(optimizers),
             "optimizer_model": (optimizers[0].get("model") if optimizers else None),
-            "has_battery": len(batteries) > 0, "battery_count": len(batteries),
+            "has_battery": len(batteries) > 0,
+            "battery_pack_count": battery_pack_count,
             "battery_model": battery_model,
-            "battery_unit_kwh": battery_unit_kwh,
-            "battery_total_kwh": battery_total_kwh if batteries else None,
+            "battery_soc_pct": battery_soc_pct,
             "has_smartguard": len(smartguards) > 0,
             "meter_count": len(meters),
         }
