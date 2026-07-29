@@ -9,18 +9,27 @@ index.html, and leaves it in the repo root for GitHub Pages to serve.
 Env vars required: FUSIONSOLAR_USER, FUSIONSOLAR_PASS
 Optional: FUSIONSOLAR_DOMAIN (default sg5.fusionsolar.huawei.com)
 """
-import os, sys, json, re, urllib.request, http.cookiejar, datetime, statistics, copy
+import os, sys, json, re, socket, time, urllib.request, urllib.error, http.cookiejar, datetime, statistics, copy
 
-DOMAIN = os.environ.get("FUSIONSOLAR_DOMAIN", "sg5.fusionsolar.huawei.com")
+# Force IPv4 resolution: some CI runners fail to resolve certain hosts over
+# IPv6 (getaddrinfo raises "No address associated with hostname"), even
+# though plain IPv4 resolution works fine.
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
+
+DOMAINS = [os.environ.get("FUSIONSOLAR_DOMAIN", "sg5.fusionsolar.huawei.com"), "intl.fusionsolar.huawei.com"]
 USER = os.environ["FUSIONSOLAR_USER"]
 PASSWORD = os.environ["FUSIONSOLAR_PASS"]
 
 cj = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+_active_domain = [DOMAINS[0]]
 
-def post(path, body):
+def _post_once(domain, path, body):
     req = urllib.request.Request(
-        f"https://{DOMAIN}{path}",
+        f"https://{domain}{path}",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -32,10 +41,22 @@ def post(path, body):
     if xsrf:
         req.add_header("XSRF-TOKEN", xsrf)
     with opener.open(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-    if not data.get("success"):
-        raise RuntimeError(f"{path} failed: {data.get('failCode')} {data.get('message')}")
-    return data
+        return json.loads(resp.read())
+
+def post(path, body):
+    last_err = None
+    for domain in [_active_domain[0]] + [d for d in DOMAINS if d != _active_domain[0]]:
+        for attempt in range(2):
+            try:
+                data = _post_once(domain, path, body)
+                _active_domain[0] = domain
+                if not data.get("success"):
+                    raise RuntimeError(f"{path} failed: {data.get('failCode')} {data.get('message')}")
+                return data
+            except (urllib.error.URLError, socket.error, TimeoutError) as e:
+                last_err = e
+                time.sleep(2)
+    raise RuntimeError(f"{path} failed against all domains: {last_err}")
 
 def login():
     post("/thirdData/login", {"userName": USER, "systemCode": PASSWORD})
