@@ -316,39 +316,6 @@ function cardHtml(p) {
     </div>`;
 }
 
-let sortedPlants = [];
-function sortPlants() {
-  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
-  sortedPlants = plants.slice().sort((a, b) => {
-    const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
-    if (af !== bf) return bf - af;
-    const ad = a.gridConnectionDate || '', bd = b.gridConnectionDate || '';
-    return bd.localeCompare(ad);
-  });
-}
-
-let openCodes = new Set();
-
-const COL_TITLES = [
-  'Inverter 3kW / 5kW — มี/ไม่มี Optimizer',
-  'Inverter 3kW / 5kW — Optimizer + Battery + Smartguard',
-  'Inverter 10kW — มี/ไม่มี Optimizer',
-  'Inverter 10kW — Optimizer + Battery + Smartguard',
-  'อื่นๆ'
-];
-
-function inverterBucket(p) {
-  const caps = (p.inverters || []).map(i => i.capacity_kw);
-  const small = caps.length > 0 && caps.every(c => c === 3 || c === 5);
-  const large = caps.length > 0 && caps.every(c => c === 10);
-  const full = !!(p.equipment && p.equipment.has_battery && p.equipment.has_smartguard);
-  if (small && !full) return 0;
-  if (small && full) return 1;
-  if (large && !full) return 2;
-  if (large && full) return 3;
-  return 4;
-}
-
 function makeChart(code) {
   const p = plants.find(x=>x.plantCode===code);
   const ctx = document.getElementById('chart-'+code);
@@ -377,6 +344,39 @@ function ensureChart(code) {
 function destroyAllCharts() {
   Object.values(charts).forEach(c => c.destroy());
   Object.keys(charts).forEach(k => delete charts[k]);
+}
+
+let sortedPlants = [];
+function sortPlants() {
+  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
+  sortedPlants = plants.slice().sort((a, b) => {
+    const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
+    if (af !== bf) return bf - af;
+    const ad = a.gridConnectionDate || '', bd = b.gridConnectionDate || '';
+    return bd.localeCompare(ad);
+  });
+}
+
+let openCodes = new Set();
+
+const COL_TITLES = [
+  'Inverter 3kW / 5kW — Optimizer เท่านั้น (ไม่มี Battery)',
+  'Inverter 3kW / 5kW — มี Battery (+ Smartguard บางส่วน)',
+  'Inverter 10kW — Optimizer เท่านั้น (ไม่มี Battery)',
+  'Inverter 10kW — มี Battery + Smartguard',
+  'อื่นๆ'
+];
+
+function inverterBucket(p) {
+  const caps = (p.inverters || []).map(i => i.capacity_kw);
+  const small = caps.length > 0 && caps.every(c => c === 3 || c === 5);
+  const large = caps.length > 0 && caps.every(c => c === 10);
+  const full = !!(p.equipment && p.equipment.has_battery);
+  if (small && !full) return 0;
+  if (small && full) return 1;
+  if (large && !full) return 2;
+  if (large && full) return 3;
+  return 4;
 }
 
 function renderGrid() {
