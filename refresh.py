@@ -120,22 +120,28 @@ def touch(path):
 
 LIVE_PAGE_URL = "https://neungyo.github.io/solar-monitoring-dashboard/"
 
-def fetch_live_pv_daily_max():
-    """Rebuild the PV1/PV2 daily-peak history dict from whatever is already
-    embedded in the currently-deployed page.
+def fetch_live_pv_today(today_str):
+    """Rebuild today's intraday PV1/PV2 voltage/current readings from
+    whatever is already embedded in the currently-deployed page.
 
     IMPORTANT CONTEXT: this script runs inside a fresh, throwaway sandbox
     every scheduled run (a Cowork scheduled task, not GitHub Actions — that
     path is blocked by Huawei's geo-restricted DNS, see .github/workflows,
-    disabled). Only index.html gets uploaded back to the repo each run; a
-    local data/*.json file written during the run does NOT survive to the
-    next run. A prior version of this script assumed data/pv_daily_max.json
-    would persist across runs (it doesn't — every run silently started from
-    an empty {}, so the "5-day PV history" never actually accumulated past
-    a single day, always showing 0.0/0.00). Fix: treat the live page itself
-    as the persistence layer — it already round-trips through GitHub every
-    run, so read back the pv_trend_5d we embedded last time and seed today's
-    dict from it before adding this run's new reading.
+    disabled). Only index.html gets uploaded back to the repo each run, so
+    a local data/*.json file written during the run does NOT survive to the
+    next run — the live page itself is the only thing that reliably
+    round-trips through GitHub every run, so we read back whatever
+    pv_trend_today we embedded last time and seed today's readings from it.
+
+    This is intentionally single-day (not the old 5-day daily-peak design):
+    per user request, PV1/PV2 tracking now shows an intraday curve across
+    the day's ~8 sunlight hours (one point per run, e.g. hourly) rather
+    than one peak-of-day point kept for 5 days — cheaper to reason about
+    and the API quota concern doesn't apply here anyway (these voltage/
+    current values come from getDevRealKpi, which is not the
+    quota-limited endpoint; that's getKpiStationDay/getDevKpiDay). Any
+    reading embedded under a date other than today_str is stale (from
+    before local midnight) and is dropped.
     """
     result = {}
     try:
@@ -150,30 +156,35 @@ def fetch_live_pv_daily_max():
             code = p.get("plantCode")
             for inv in p.get("inverters", []):
                 sn = inv.get("sn")
-                for pv_name, entries in (inv.get("pv_trend_5d") or {}).items():
+                for pv_name, entries in (inv.get("pv_trend_today") or {}).items():
                     key = f"{code}|{sn}|{pv_name}"
-                    day_map = {}
+                    todays = []
                     for e in entries:
+                        if e.get("date") != today_str:
+                            continue
                         v = e.get("voltage_v")
                         i = e.get("current_a")
-                        if v is None or i is None:
+                        t = e.get("time")
+                        if v is None or i is None or t is None:
                             continue
-                        day_map[e["date"]] = {"v": v, "i": i, "w": round(v * i, 1)}
-                    if day_map:
-                        result[key] = day_map
+                        todays.append({"time": t, "v": v, "i": i})
+                    if todays:
+                        result[key] = todays
     except Exception as e:
-        print(f"WARN: could not seed PV history from live page ({e}); starting fresh", file=sys.stderr)
+        print(f"WARN: could not seed today's PV readings from live page ({e}); starting fresh", file=sys.stderr)
     return result
 
 def main():
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     today_str = now.strftime("%Y-%m-%d")
+    now_hhmm = now.strftime("%H:%M")
     anomaly_cutoff_date = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
 
-    # PV1/PV2 daily-max power history. Seeded from the live deployed page
-    # (see fetch_live_pv_daily_max) since this sandbox itself is thrown away
-    # after every run — data/pv_daily_max.json never survives to be reused.
-    pv_daily_max = fetch_live_pv_daily_max()
+    # PV1/PV2 intraday voltage/current curve for today only (see
+    # fetch_live_pv_today docstring for why this replaced the old 5-day
+    # daily-peak design). Seeded from the live deployed page since this
+    # sandbox itself is thrown away after every run.
+    pv_today = fetch_live_pv_today(today_str)
 
     login()
 
@@ -220,6 +231,16 @@ def main():
         "endTime": int(end.timestamp() * 1000),
         "language": "en_US",
     })["data"]
+
+    # getAlarmList's raw stationName is the FULL, unmasked customer name
+    # (e.g. "คุณจงรักษ์ ขวัญชื่น_ TS260600104") — overwrite it with the
+    # masked name before it ever gets embedded in the public index.html.
+    # Without this, the raw name was being written straight into the
+    # page's JSON (viewable via page source) even though the alarms table
+    # only displayed stationCode — a real privacy leak, now closed.
+    station_masked_by_code = {s["plantCode"]: mask_name(s["plantName"]) for s in stations}
+    for a in alarms:
+        a["stationName"] = station_masked_by_code.get(a.get("stationCode"), "Unknown xxxxxx")
 
     # ---- historical day + weather: refresh at most hourly ----
     if stale("data/hourly_refreshed_at.json", 3600) or not os.path.exists("data/kpiday.json"):
@@ -315,35 +336,34 @@ def main():
                 item = dd.get(t, {})
                 inv_trend.append({"date": dstr, "power_kwh": item.get("product_power"), "perf_ratio": item.get("perpower_ratio")})
 
-            # PV1/PV2 daily voltage/current tracking. Confirmed against the
-            # live API: getDevKpiDay (the historical daily endpoint) only
-            # returns product_power/perpower_ratio for inverters — no
+            # PV1/PV2 intraday voltage/current tracking. Confirmed against
+            # the live API: getDevKpiDay (the historical daily endpoint)
+            # only returns product_power/perpower_ratio for inverters — no
             # string-level V/A history exists anywhere in the Northbound
-            # API. So we build our own rolling history by snapshotting each
-            # string's V/A at the moment of highest output seen that
-            # calendar day. This script runs hourly via a Cowork scheduled
-            # task (not GitHub Actions — blocked by Huawei's geo-DNS); each
-            # run is a fresh throwaway sandbox, so pv_daily_max is seeded at
-            # the top of main() from the live page's own embedded data
-            # (fetch_live_pv_daily_max) rather than a local file, letting
-            # ~5 days of real history accumulate across runs.
+            # API. So we build our own curve by recording each string's V/A
+            # once per run (this script runs hourly via a Cowork scheduled
+            # task, not GitHub Actions — blocked by Huawei's geo-DNS),
+            # covering roughly the day's 8 sunlight hours, then resetting
+            # at local midnight. Each run is a fresh throwaway sandbox, so
+            # pv_today is seeded at the top of main() from the live page's
+            # own embedded data (fetch_live_pv_today) rather than a local
+            # file.
             sn = inv.get("esnCode")
-            pv_trend_5d = {}
+            pv_trend_today = {}
             for i in (1, 2):
                 u = real_kpi.get(f"pv{i}_u")
                 ii = real_kpi.get(f"pv{i}_i")
                 key = f"{code}|{sn}|PV{i}"
                 if u is not None and ii is not None:
-                    power_w = round(u * ii, 1)
-                    day_map = pv_daily_max.setdefault(key, {})
-                    cur = day_map.get(today_str)
-                    if cur is None or power_w > cur.get("w", -1):
-                        day_map[today_str] = {"v": round(u, 1), "i": round(ii, 2), "w": power_w}
-                day_map = pv_daily_max.get(key, {})
-                last5 = sorted(day_map.keys())[-5:]
-                pv_trend_5d[f"PV{i}"] = [
-                    {"date": d, "voltage_v": day_map[d]["v"], "current_a": day_map[d]["i"]}
-                    for d in last5
+                    entries = pv_today.setdefault(key, [])
+                    # collapse to at most one point per hour, in case this
+                    # run happens to land in the same hour as the last one
+                    if not entries or entries[-1]["time"][:2] != now_hhmm[:2]:
+                        entries.append({"time": now_hhmm, "v": round(u, 1), "i": round(ii, 2)})
+                entries = pv_today.get(key, [])
+                pv_trend_today[f"PV{i}"] = [
+                    {"date": today_str, "time": e["time"], "voltage_v": e["v"], "current_a": e["i"]}
+                    for e in entries
                 ]
 
             inv_out.append({
@@ -354,7 +374,7 @@ def main():
                 "active_power_kw": real_kpi.get("active_power"),
                 "day_energy_kwh": real_kpi.get("day_cap"),
                 "strings": strings, "trend_10d": inv_trend,
-                "pv_trend_5d": pv_trend_5d,
+                "pv_trend_today": pv_trend_today,
             })
 
         # Battery: devlist only ever lists one logical "Battery-1" combiner
@@ -405,10 +425,9 @@ def main():
             "trend_10d": trend, "inverters": inv_out, "equipment": equipment,
         })
 
-    # (pv_daily_max itself is scratch state for this run only — each
-    # inverter's pv_trend_5d was already sliced to the last 5 dates above,
-    # and no local file needs saving since the next run reseeds from the
-    # deployed index.html, not from disk.)
+    # (pv_today itself is scratch state for this run only — each inverter's
+    # pv_trend_today was already read off it above, and no local file needs
+    # saving since the next run reseeds from the deployed index.html.)
 
     # anomaly detection
     for p in plants_out:
