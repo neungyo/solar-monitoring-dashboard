@@ -120,18 +120,51 @@ def touch(path):
 
 LIVE_PAGE_URL = "https://neungyo.github.io/solar-monitoring-dashboard/"
 
-def fetch_live_pv_today(today_str):
-    """Rebuild today's intraday PV1/PV2 voltage/current readings from
-    whatever is already embedded in the currently-deployed page.
+# How long the historical-day + weather block (getKpiStationDay/getDevKpiDay,
+# the daily-quota endpoints) can go before it's considered stale enough to
+# refetch. Per Huawei's official SmartPVMS 25.1.0 NBI Reference (section 4.2
+# Flow Control Using the API Account), getDevKpiDay's real budget is
+# ∑Roundup(devices per type/100) + 24 per day — for our 33 type-38 +
+# 4 type-1 inverters that's 1+1+24 = 26 calls/day. We call it twice per
+# refresh (once per device type), so refreshing hourly (24x/day) would burn
+# 48 calls/day — nearly double the budget, and would start failing partway
+# through the day. At this threshold it refreshes at most 6x/day = 12 calls,
+# comfortably under budget even with a couple of extra manual triggers.
+HIST_STALE_SECONDS = 4 * 3600
+
+def fetch_live_state():
+    """Fetch and parse the currently-deployed page's embedded DATA blob once.
+    Returns {} if unavailable (first run ever, or the fetch fails).
 
     IMPORTANT CONTEXT: this script runs inside a fresh, throwaway sandbox
     every scheduled run (a Cowork scheduled task, not GitHub Actions — that
     path is blocked by Huawei's geo-restricted DNS, see .github/workflows,
     disabled). Only index.html gets uploaded back to the repo each run, so
-    a local data/*.json file written during the run does NOT survive to the
-    next run — the live page itself is the only thing that reliably
-    round-trips through GitHub every run, so we read back whatever
-    pv_trend_today we embedded last time and seed today's readings from it.
+    anything written to a local data/*.json file during the run does NOT
+    survive to the next run — the live page itself is the only thing that
+    reliably round-trips through GitHub every run. This single fetch backs
+    two independent features:
+      1. Seeding today's intraday PV1/PV2 curve (see pv_today_from_state).
+      2. Letting the historical-day + weather block below skip re-querying
+         Huawei when it was refreshed recently, by reusing each plant's/
+         inverter's already-embedded trend_10d and weather symbol instead of
+         leaving them blank (see HIST_STALE_SECONDS and its usage in main()).
+    """
+    try:
+        req = urllib.request.Request(LIVE_PAGE_URL, headers={"Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r"const DATA = (.*?);\s*\nconst ICONS", html, re.S)
+        if not m:
+            return {}
+        return json.loads(m.group(1))
+    except Exception as e:
+        print(f"WARN: could not fetch live page state ({e}); starting fresh", file=sys.stderr)
+        return {}
+
+def pv_today_from_state(state, today_str):
+    """Rebuild today's intraday PV1/PV2 voltage/current readings from an
+    already-fetched live-page state dict (see fetch_live_state).
 
     This is intentionally single-day (not the old 5-day daily-peak design):
     per user request, PV1/PV2 tracking now shows an intraday curve across
@@ -144,34 +177,24 @@ def fetch_live_pv_today(today_str):
     before local midnight) and is dropped.
     """
     result = {}
-    try:
-        req = urllib.request.Request(LIVE_PAGE_URL, headers={"Cache-Control": "no-cache"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        m = re.search(r"const DATA = (.*?);\s*\nconst ICONS", html, re.S)
-        if not m:
-            return result
-        data = json.loads(m.group(1))
-        for p in data.get("plants", []):
-            code = p.get("plantCode")
-            for inv in p.get("inverters", []):
-                sn = inv.get("sn")
-                for pv_name, entries in (inv.get("pv_trend_today") or {}).items():
-                    key = f"{code}|{sn}|{pv_name}"
-                    todays = []
-                    for e in entries:
-                        if e.get("date") != today_str:
-                            continue
-                        v = e.get("voltage_v")
-                        i = e.get("current_a")
-                        t = e.get("time")
-                        if v is None or i is None or t is None:
-                            continue
-                        todays.append({"time": t, "v": v, "i": i})
-                    if todays:
-                        result[key] = todays
-    except Exception as e:
-        print(f"WARN: could not seed today's PV readings from live page ({e}); starting fresh", file=sys.stderr)
+    for p in state.get("plants", []):
+        code = p.get("plantCode")
+        for inv in p.get("inverters", []):
+            sn = inv.get("sn")
+            for pv_name, entries in (inv.get("pv_trend_today") or {}).items():
+                key = f"{code}|{sn}|{pv_name}"
+                todays = []
+                for e in entries:
+                    if e.get("date") != today_str:
+                        continue
+                    v = e.get("voltage_v")
+                    i = e.get("current_a")
+                    t = e.get("time")
+                    if v is None or i is None or t is None:
+                        continue
+                    todays.append({"time": t, "v": v, "i": i})
+                if todays:
+                    result[key] = todays
     return result
 
 def main():
@@ -180,11 +203,21 @@ def main():
     now_hhmm = now.strftime("%H:%M")
     anomaly_cutoff_date = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
 
-    # PV1/PV2 intraday voltage/current curve for today only (see
-    # fetch_live_pv_today docstring for why this replaced the old 5-day
-    # daily-peak design). Seeded from the live deployed page since this
-    # sandbox itself is thrown away after every run.
-    pv_today = fetch_live_pv_today(today_str)
+    # Single fetch of the live page's embedded state — backs both the PV1/PV2
+    # intraday curve and the historical-day/weather reuse-if-fresh check
+    # below (see fetch_live_state docstring).
+    live_state = fetch_live_state()
+    pv_today = pv_today_from_state(live_state, today_str)
+    live_plants_by_code = {p["plantCode"]: p for p in live_state.get("plants", [])}
+
+    hist_ts_str = live_state.get("historical_refreshed_at")
+    hist_is_fresh = False
+    if hist_ts_str:
+        try:
+            hist_ts = datetime.datetime.fromisoformat(hist_ts_str)
+            hist_is_fresh = (now - hist_ts).total_seconds() < HIST_STALE_SECONDS
+        except Exception:
+            hist_is_fresh = False
 
     login()
 
@@ -242,8 +275,14 @@ def main():
     for a in alarms:
         a["stationName"] = station_masked_by_code.get(a.get("stationCode"), "Unknown xxxxxx")
 
-    # ---- historical day + weather: refresh at most hourly ----
-    if stale("data/hourly_refreshed_at.json", 3600) or not os.path.exists("data/kpiday.json"):
+    # ---- historical day + weather: refresh at most every HIST_STALE_SECONDS ----
+    # (see HIST_STALE_SECONDS comment above for the exact quota math). When
+    # not fresh enough to skip, we still can't reuse a local data/*.json
+    # cache — this sandbox is thrown away every run — so we reuse the
+    # already-embedded trend_10d/weather values from live_state instead
+    # (per-plant and per-inverter, applied further down in the combine
+    # step), rather than leaving the charts blank on skipped runs.
+    if not hist_is_fresh:
         collect = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
         kpiday = post("/thirdData/getKpiStationDay", {"stationCodes": codes, "collectTime": collect})["data"]
         devkpiday = []
@@ -257,20 +296,20 @@ def main():
                 weather[s["plantCode"]] = fetch_weather(s["latitude"], s["longitude"])
             except Exception as e:
                 weather[s["plantCode"]] = {"error": str(e)}
-        save_json("data/kpiday.json", kpiday)
-        save_json("data/devkpiday.json", devkpiday)
-        save_json("data/weather.json", weather)
-        touch("data/hourly_refreshed_at.json")
+        historical_refreshed_at = now.isoformat()
     else:
-        kpiday = load_json("data/kpiday.json")
-        devkpiday = load_json("data/devkpiday.json")
-        weather = load_json("data/weather.json")
+        kpiday, devkpiday, weather = [], [], {}
+        historical_refreshed_at = hist_ts_str
 
     # ================= combine =================
     real_by_code = {r["stationCode"]: r["dataItemMap"] for r in realkpi}
-    all_times = sorted(set(x["collectTime"] for x in kpiday))
-    last10 = all_times[-10:]
-    dates10 = [datetime.datetime.utcfromtimestamp(t / 1000).strftime("%Y-%m-%d") for t in last10]
+    if hist_is_fresh:
+        dates10 = live_state.get("dates10", [])
+        last10 = []
+    else:
+        all_times = sorted(set(x["collectTime"] for x in kpiday))
+        last10 = all_times[-10:]
+        dates10 = [datetime.datetime.utcfromtimestamp(t / 1000).strftime("%Y-%m-%d") for t in last10]
     by_station_day = {}
     for x in kpiday:
         if x["collectTime"] in last10:
@@ -299,26 +338,37 @@ def main():
         smartguards = [d for d in devs if d["devTypeId"] == 23071]
         meters = [d for d in devs if d["devTypeId"] in (47, 23076)]
 
-        day_data = by_station_day.get(code, {})
-        trend = []
-        for t, dstr in zip(last10, dates10):
-            item = day_data.get(t, {})
-            wcode = None
-            precip = None
-            try:
-                idx = weather.get(code, {}).get("time", []).index(dstr)
-                wcode = weather[code]["weathercode"][idx]
-                precip = weather[code]["precipitation_sum"][idx]
-            except (ValueError, KeyError):
-                pass
-            sym, label = wcode_symbol(wcode)
-            trend.append({"date": dstr, "power_kwh": item.get("inverter_power"),
-                           "perf_ratio": item.get("perpower_ratio"), "weather_symbol": sym,
-                           "weather_label": label, "precip_mm": precip})
+        live_plant = live_plants_by_code.get(code, {})
+        if hist_is_fresh:
+            # Historical/weather block was skipped this run (see
+            # HIST_STALE_SECONDS) — carry forward what was already embedded
+            # last time rather than leaving the 10-day chart/weather blank.
+            trend = live_plant.get("trend_10d", [])
+            today_sym = live_plant.get("today_weather_symbol", "?")
+            today_label = live_plant.get("today_weather_label", "ไม่มีข้อมูล")
+        else:
+            day_data = by_station_day.get(code, {})
+            trend = []
+            for t, dstr in zip(last10, dates10):
+                item = day_data.get(t, {})
+                wcode = None
+                precip = None
+                try:
+                    idx = weather.get(code, {}).get("time", []).index(dstr)
+                    wcode = weather[code]["weathercode"][idx]
+                    precip = weather[code]["precipitation_sum"][idx]
+                except (ValueError, KeyError):
+                    pass
+                sym, label = wcode_symbol(wcode)
+                trend.append({"date": dstr, "power_kwh": item.get("inverter_power"),
+                               "perf_ratio": item.get("perpower_ratio"), "weather_symbol": sym,
+                               "weather_label": label, "precip_mm": precip})
 
-        wdata = weather.get(code, {})
-        today_wcode = wdata.get("weathercode", [None])[-1] if wdata.get("weathercode") else None
-        today_sym, today_label = wcode_symbol(today_wcode)
+            wdata = weather.get(code, {})
+            today_wcode = wdata.get("weathercode", [None])[-1] if wdata.get("weathercode") else None
+            today_sym, today_label = wcode_symbol(today_wcode)
+
+        live_inv_by_sn = {i.get("sn"): i for i in live_plant.get("inverters", [])}
 
         inv_out = []
         for inv in inverters:
@@ -330,11 +380,16 @@ def main():
                 ii = real_kpi.get(f"pv{i}_i")
                 if u is not None:
                     strings.append({"string": f"PV{i}", "voltage_v": u, "current_a": ii})
-            dd = devday_by_devid.get(devid, {})
-            inv_trend = []
-            for t, dstr in zip(dev_last10, dev_dates10):
-                item = dd.get(t, {})
-                inv_trend.append({"date": dstr, "power_kwh": item.get("product_power"), "perf_ratio": item.get("perpower_ratio")})
+            if hist_is_fresh:
+                # carried forward from the last actual refresh, same reason
+                # as the plant-level trend above
+                inv_trend = live_inv_by_sn.get(inv.get("esnCode"), {}).get("trend_10d", [])
+            else:
+                dd = devday_by_devid.get(devid, {})
+                inv_trend = []
+                for t, dstr in zip(dev_last10, dev_dates10):
+                    item = dd.get(t, {})
+                    inv_trend.append({"date": dstr, "power_kwh": item.get("product_power"), "perf_ratio": item.get("perpower_ratio")})
 
             # PV1/PV2 intraday voltage/current tracking. Confirmed against
             # the live API: getDevKpiDay (the historical daily endpoint)
@@ -346,8 +401,8 @@ def main():
             # covering roughly the day's 8 sunlight hours, then resetting
             # at local midnight. Each run is a fresh throwaway sandbox, so
             # pv_today is seeded at the top of main() from the live page's
-            # own embedded data (fetch_live_pv_today) rather than a local
-            # file.
+            # own embedded data (fetch_live_state / pv_today_from_state)
+            # rather than a local file.
             sn = inv.get("esnCode")
             pv_trend_today = {}
             for i in (1, 2):
@@ -452,15 +507,26 @@ def main():
                 overall = statistics.mean([a[1] for a in avgs])
                 for sn, avg in avgs:
                     if overall > 0 and avg < overall * 0.7:
+                        # NOTE: this is perpower_ratio (Huawei's "Specific
+                        # energy", kWh produced per kWp installed per day) —
+                        # per the official NBI reference, getDevKpiDay has no
+                        # true % Performance Ratio field at the device level
+                        # (that field, performance_ratio, only exists at the
+                        # plant level via getKpiStationDay). Comparing
+                        # specific yield across inverters at the same site
+                        # is still a valid way to catch an underperforming
+                        # string/inverter, but the label should say what the
+                        # number actually is.
                         anomalies.append({"date": None, "type": "inverter_underperform",
-                            "detail": f"Inverter {sn}: ค่าเฉลี่ย performance ratio 10 วัน ({avg:.2f}) ต่ำกว่าค่าเฉลี่ยรวมของสถานี ({overall:.2f}) อย่างมีนัยสำคัญ — อาจมี string หรือ inverter ตัวนี้ทำงานผิดปกติ"})
+                            "detail": f"Inverter {sn}: ผลผลิตต่อกำลังติดตั้งเฉลี่ย 10 วัน (specific yield) {avg:.2f} kWh/kWp ต่ำกว่าค่าเฉลี่ยรวมของสถานี ({overall:.2f} kWh/kWp) อย่างมีนัยสำคัญ — อาจมี string หรือ inverter ตัวนี้ทำงานผิดปกติ"})
         for inv in invs:
             t = inv.get("temperature_c")
             if t is not None and t >= 65:
                 anomalies.append({"date": None, "type": "high_temp", "detail": f"Inverter {inv['sn']}: อุณหภูมิ {t}°C สูง ควรตรวจสอบการระบายความร้อน"})
         p["anomalies"] = anomalies
 
-    out = {"generated_at": now.isoformat(), "dates10": dates10, "plants": plants_out, "alarms_5day": alarms}
+    out = {"generated_at": now.isoformat(), "dates10": dates10, "plants": plants_out,
+           "alarms_5day": alarms, "historical_refreshed_at": historical_refreshed_at}
     save_json("dashboard_data_public_live.json", out)
     build_html(out)
 
