@@ -78,9 +78,9 @@ th { color:var(--muted); font-weight:normal; }
 <div class="container">
   <div class="note-box">
     <b>เวอร์ชันสาธารณะ (Public)</b> — ตัดชื่อ (เหลือแค่ชื่อจริงบางส่วน), ที่อยู่, เบอร์โทร/อีเมลลูกค้า และพิกัด GPS ออกแล้ว เพื่อไม่ให้ข้อมูลส่วนบุคคลของลูกค้าเผยแพร่บนอินเทอร์เน็ตสาธารณะ<br>
-    ข้อมูลนี้ <b>อัปเดตอัตโนมัติทุก 15-30 นาที</b> ผ่าน GitHub Actions (ดึงสดจาก Huawei FusionSolar Northbound API) — แค่รีเฟรชหน้านี้ก็เห็นข้อมูลล่าสุดที่ระบบดึงมาได้เลย ไม่ต้องแจ้งในแชท<br>
+    ข้อมูลนี้อัปเดตผ่าน Cowork scheduled task ที่ดึงสดจาก Huawei FusionSolar Northbound API แล้ว push ขึ้นหน้านี้โดยตรง (ไม่ใช่ GitHub Actions — ถูกบล็อกด้วยข้อจำกัด geo-DNS ของ Huawei) รีเฟรชตามรอบที่ตั้งไว้ หรือสั่งรีเฟรชครั้งเดียวได้ผ่านแชท<br>
     ขอบเขต: เฉพาะ 37 สถานีของ Synnex Thailand ที่บัญชี API นี้เข้าถึงได้ — ยังไม่รวม shared plants (~30 สถานีที่เหลือจากทั้งหมด 67)<br>
-    ข้อจำกัดของ API: ข้อมูลระดับ PV string (PV1-8) แบบย้อนหลังรายวันไม่มีให้ผ่าน Northbound API — มีเฉพาะค่าปัจจุบัน (real-time) เท่านั้น ส่วนย้อนหลัง 10 วันระดับ string ใช้ค่า performance ของแต่ละ inverter แทน
+    ข้อจำกัดของ API: ข้อมูลระดับ PV string (PV1-8) แบบย้อนหลังรายวันไม่มีให้ผ่าน Northbound API — มีเฉพาะค่าปัจจุบัน (real-time) เท่านั้น ส่วนย้อนหลัง 10 วันระดับ string ใช้ค่า performance ของแต่ละ inverter แทน ส่วน PV1/PV2 ด้านล่างเป็นกราฟรายชั่วโมงของวันนี้ (รีเซ็ตทุกเที่ยงคืน)
   </div>
 
   <div class="summary" id="summaryCards"></div>
@@ -147,7 +147,7 @@ if (DATA.alarms_5day.length === 0) {
 } else {
   let t = '<table><tr><th>สถานี</th><th>ชื่อ Alarm</th><th>ระดับ</th><th>เวลาที่เกิด</th><th>สถานะ</th></tr>';
   DATA.alarms_5day.forEach(a => {
-    t += `<tr><td>${a.stationCode||''}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${a.raiseTime||''}</td><td>${a.status||''}</td></tr>`;
+    t += `<tr><td>${a.stationName||a.stationCode||''}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${a.raiseTime||''}</td><td>${a.status||''}</td></tr>`;
   });
   t += '</table>';
   alarmsBox.innerHTML = t;
@@ -169,18 +169,19 @@ function batteryDetailText(eq) {
   return `${eq.battery_pack_count} ก้อน (${eq.battery_model||'-'}) — SOC ปัจจุบัน: ${soc}`;
 }
 
-// PV1/PV2 day-over-day history: for each string, show voltage & current at
-// the moment of that day's highest output, across up to 5 days — lets you
-// see e.g. PV1 today vs PV1 yesterday to catch a string slowly degrading
-// (loose connector, hot/tripping breaker, etc.), rather than PV1 vs PV2.
+// PV1/PV2 intraday history: for each string, show voltage & current at
+// each refresh run today (roughly hourly across the day's ~8 sunlight
+// hours), resetting every local midnight — lets you catch a string
+// dropping off partway through the day (loose connector, hot/tripping
+// breaker, etc.), rather than comparing PV1 vs PV2.
 function pvHistoryTable(inv, key, label) {
-  const rows = (inv.pv_trend_5d && inv.pv_trend_5d[key]) || [];
+  const rows = (inv.pv_trend_today && inv.pv_trend_today[key]) || [];
   if (!rows.length) return '';
   return `
     <div style="margin-top:8px;">
       <div class="small-muted" style="margin-bottom:3px;">${label}</div>
       <table>
-        <tr><th></th>${rows.map(r=>`<th>${r.date.substring(5)}</th>`).join('')}</tr>
+        <tr><th></th>${rows.map(r=>`<th>${r.time}</th>`).join('')}</tr>
         <tr><td>V</td>${rows.map(r=>`<td>${fmt(r.voltage_v,1)}</td>`).join('')}</tr>
         <tr><td>A</td>${rows.map(r=>`<td>${fmt(r.current_a,2)}</td>`).join('')}</tr>
       </table>
@@ -192,9 +193,9 @@ function pvCompareHtml(inv) {
   if (!t1 && !t2) return '';
   return `
     <div class="pv-compare">
-      <div class="small-muted" style="margin-bottom:2px;">&#9889; ประวัติแรงดัน/กระแส PV1 กับ PV2 ย้อนหลัง (ที่จุดกำลังผลิตสูงสุดของแต่ละวัน)</div>
+      <div class="small-muted" style="margin-bottom:2px;">&#9889; แรงดัน/กระแส PV1 กับ PV2 รายชั่วโมงของวันนี้</div>
       ${t1}${t2}
-      <div class="pv-note">สะสมจากการรีเฟรชทุก 15-30 นาที (Northbound API ไม่มี log ประวัติระดับ PV string ต้องสะสมเอง — ข้อมูลจะครบ 5 วันภายในไม่กี่วันแรกหลังเริ่มใช้ ถ้า V หรือ A ของ PV ไหนลดลงต่อเนื่องวันต่อวัน อาจบ่งบอกสายหลวม/breaker ร้อนหรือทริป ควรตรวจสอบ)</div>
+      <div class="pv-note">สะสมทีละจุดทุกครั้งที่รีเฟรช (Northbound API ไม่มี log ประวัติระดับ PV string ต้องสะสมเอง) — รีเซ็ตใหม่ทุกเที่ยงคืน ถ้า V หรือ A ของ PV ไหนตกฮวบระหว่างวันหรือต่ำกว่าอีกช่องผิดปกติ อาจบ่งบอกสายหลวม/breaker ร้อนหรือทริป ควรตรวจสอบ</div>
     </div>`;
 }
 
