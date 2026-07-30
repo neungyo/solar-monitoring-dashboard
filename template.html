@@ -28,8 +28,9 @@ header .meta { color: var(--muted); font-size: 13px; }
 .controls { margin-bottom:16px; display:flex; gap:10px; }
 .controls input, .controls select { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:8px 12px; border-radius:6px; font-size:13px; }
 .controls input { flex:1; max-width:320px; }
-.plant-grid { display:flex; flex-direction:column; gap:14px; }
-.plant-row { display:grid; gap:14px; align-items:start; }
+.plant-grid { display:grid; grid-template-columns: repeat(4, minmax(280px, 1fr)); gap:14px; align-items:start; overflow-x:auto; }
+.plant-col { display:flex; flex-direction:column; gap:14px; min-width:0; }
+.plant-col-title { font-size:12.5px; font-weight:bold; color:var(--muted); padding-bottom:8px; border-bottom:1px solid var(--border); margin-bottom:2px; }
 .plant-card { background: var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
 .plant-head { padding:14px 16px; cursor:pointer; display:flex; justify-content:space-between; align-items:flex-start; }
 .plant-head:hover { background: var(--panel2); }
@@ -108,7 +109,7 @@ th { color:var(--muted); font-weight:normal; }
       <option value="anom">มีจุดที่ควรตรวจสอบ</option>
     </select>
   </div>
-  <div class="sort-note">เรียงตามวันที่เชื่อมกริดล่าสุดก่อนเสมอ — สถานีที่มีจุดควรตรวจสอบหรือสถานะผิดปกติจะถูกดันขึ้นบนสุดเสมอ</div>
+  <div class="sort-note">แบ่งเป็น 4 คอลัมน์ตามขนาด inverter และอุปกรณ์ที่ติดตั้ง (ทั้ง 1 phase และ 3 phase อยู่คอลัมน์เดียวกัน) — ในแต่ละคอลัมน์เรียงตามวันที่เชื่อมกริดล่าสุดก่อนเสมอ สถานีที่มีจุดควรตรวจสอบหรือสถานะผิดปกติจะถูกดันขึ้นบนสุดเสมอ</div>
   <div class="plant-grid" id="plantGrid"></div>
 </div>
 
@@ -231,11 +232,6 @@ function batteryDetailText(eq) {
   return `${eq.battery_pack_count} ก้อน (${eq.battery_model||'-'}) — SOC ปัจจุบัน: ${soc}`;
 }
 
-// PV1/PV2 intraday history: for each string, show voltage & current at
-// each refresh run today (roughly hourly across the day's ~8 sunlight
-// hours), resetting every local midnight — lets you catch a string
-// dropping off partway through the day (loose connector, hot/tripping
-// breaker, etc.), rather than comparing PV1 vs PV2.
 function pvHistoryTable(inv, key, label) {
   const rows = (inv.pv_trend_today && inv.pv_trend_today[key]) || [];
   if (!rows.length) return '';
@@ -261,11 +257,11 @@ function pvCompareHtml(inv) {
     </div>`;
 }
 
-function cardHtml(p, rowIndex) {
+function cardHtml(p) {
   const wIcon = ICONS[p.today_weather_symbol] || ICONS['?'];
   return `
     <div class="plant-card" data-code="${p.plantCode}" data-name="${(p.plantName+p.plantCode).toLowerCase()}" data-health="${p.health_state===3?'ok':'bad'}" data-anom="${(p.anomalies&&p.anomalies.length)?'anom':''}">
-      <div class="plant-head" onclick="toggleRow(${rowIndex})">
+      <div class="plant-head" onclick="toggleCard('${p.plantCode}')">
         <div>
           <div class="plant-name">${p.plantName}</div>
           <div class="plant-sub">${fmt(p.capacity_kwp,2)} kWp · ${p.inverters.length} inverter(s)</div>
@@ -320,6 +316,39 @@ function cardHtml(p, rowIndex) {
     </div>`;
 }
 
+let sortedPlants = [];
+function sortPlants() {
+  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
+  sortedPlants = plants.slice().sort((a, b) => {
+    const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
+    if (af !== bf) return bf - af;
+    const ad = a.gridConnectionDate || '', bd = b.gridConnectionDate || '';
+    return bd.localeCompare(ad);
+  });
+}
+
+let openCodes = new Set();
+
+const COL_TITLES = [
+  'Inverter 3kW / 5kW — มี/ไม่มี Optimizer',
+  'Inverter 3kW / 5kW — Optimizer + Battery + Smartguard',
+  'Inverter 10kW — มี/ไม่มี Optimizer',
+  'Inverter 10kW — Optimizer + Battery + Smartguard',
+  'อื่นๆ'
+];
+
+function inverterBucket(p) {
+  const caps = (p.inverters || []).map(i => i.capacity_kw);
+  const small = caps.length > 0 && caps.every(c => c === 3 || c === 5);
+  const large = caps.length > 0 && caps.every(c => c === 10);
+  const full = !!(p.equipment && p.equipment.has_battery && p.equipment.has_smartguard);
+  if (small && !full) return 0;
+  if (small && full) return 1;
+  if (large && !full) return 2;
+  if (large && full) return 3;
+  return 4;
+}
+
 function makeChart(code) {
   const p = plants.find(x=>x.plantCode===code);
   const ctx = document.getElementById('chart-'+code);
@@ -350,71 +379,40 @@ function destroyAllCharts() {
   Object.keys(charts).forEach(k => delete charts[k]);
 }
 
-// --- sorting: grid-connection-date descending, with any flagged (unhealthy
-// or has an active "needs attention" item) plant always pinned to the top ---
-let sortedPlants = [];
-function sortPlants() {
-  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
-  sortedPlants = plants.slice().sort((a, b) => {
-    const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
-    if (af !== bf) return bf - af;
-    const ad = a.gridConnectionDate || '', bd = b.gridConnectionDate || '';
-    return bd.localeCompare(ad);
-  });
-}
-
-// --- row-grouped grid: cards are grouped into explicit "row" wrapper divs so
-// that expanding/collapsing any card in a row expands/collapses every card
-// in that same visual row together. Row membership is recomputed on resize. ---
-let rowsOfCodes = [];
-let openCodes = new Set();
-let lastCols = 0;
-
-function computeCols() {
-  const w = grid.clientWidth || window.innerWidth;
-  const minW = 360, gap = 14;
-  return Math.max(1, Math.floor((w + gap) / (minW + gap)));
-}
-
 function renderGrid() {
   destroyAllCharts();
   sortPlants();
-  const cols = computeCols();
-  lastCols = cols;
-  rowsOfCodes = [];
   grid.innerHTML = '';
-  for (let i = 0; i < sortedPlants.length; i += cols) {
-    const rowPlants = sortedPlants.slice(i, i + cols);
-    const rowIndex = rowsOfCodes.length;
-    rowsOfCodes.push(rowPlants.map(p => p.plantCode));
-    const rowDiv = document.createElement('div');
-    rowDiv.className = 'plant-row';
-    rowDiv.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-    rowDiv.innerHTML = rowPlants.map(p => cardHtml(p, rowIndex)).join('');
-    grid.appendChild(rowDiv);
-  }
+  const buckets = [[], [], [], [], []];
+  sortedPlants.forEach(p => buckets[inverterBucket(p)].push(p));
+  buckets.forEach((bucketPlants, i) => {
+    if (bucketPlants.length === 0) return;
+    const colDiv = document.createElement('div');
+    colDiv.className = 'plant-col';
+    const titleDiv = document.createElement('div');
+    titleDiv.className = 'plant-col-title';
+    titleDiv.textContent = `${COL_TITLES[i]} (${bucketPlants.length})`;
+    colDiv.appendChild(titleDiv);
+    colDiv.insertAdjacentHTML('beforeend', bucketPlants.map(p => cardHtml(p)).join(''));
+    grid.appendChild(colDiv);
+  });
   applyOpenState();
   applyFilters();
 }
 
 function applyOpenState() {
-  rowsOfCodes.forEach(codes => {
-    const isOpen = codes.length > 0 && codes.every(c => openCodes.has(c));
-    codes.forEach(c => {
-      const body = document.getElementById('body-' + c);
-      if (!body) return;
-      if (isOpen) { body.classList.add('open'); ensureChart(c); }
-      else { body.classList.remove('open'); }
-    });
+  document.querySelectorAll('.plant-card').forEach(card => {
+    const c = card.dataset.code;
+    const body = document.getElementById('body-' + c);
+    if (!body) return;
+    if (openCodes.has(c)) { body.classList.add('open'); ensureChart(c); }
+    else { body.classList.remove('open'); }
   });
 }
 
-function toggleRow(rowIndex) {
-  const codes = rowsOfCodes[rowIndex];
-  if (!codes) return;
-  const isOpen = codes.every(c => openCodes.has(c));
-  if (isOpen) { codes.forEach(c => openCodes.delete(c)); }
-  else { codes.forEach(c => openCodes.add(c)); }
+function toggleCard(code) {
+  if (openCodes.has(code)) openCodes.delete(code);
+  else openCodes.add(code);
   applyOpenState();
 }
 
@@ -423,7 +421,7 @@ function collapseAll() {
   applyOpenState();
 }
 function expandAll() {
-  sortedPlants.forEach(p => openCodes.add(p.plantCode));
+  plants.forEach(p => openCodes.add(p.plantCode));
   applyOpenState();
 }
 
@@ -443,14 +441,6 @@ document.getElementById('filterHealth').addEventListener('change', applyFilters)
 document.getElementById('filterAnom').addEventListener('change', applyFilters);
 
 renderGrid();
-
-let resizeTimer;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    if (computeCols() !== lastCols) renderGrid();
-  }, 200);
-});
 </script>
 </body>
 </html>
