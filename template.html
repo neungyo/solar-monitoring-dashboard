@@ -73,6 +73,7 @@ th { color:var(--muted); font-weight:normal; }
   <div style="margin-top:10px;">
     <button class="btn" onclick="collapseAll()">&#8593; ย่อทั้งหมด</button>
     <button class="btn" onclick="expandAll()">&#8595; ขยายทั้งหมด</button>
+    <button class="btn" id="liveBtn" onclick="fetchLiveSnapshot()">&#9889; ดึงข้อมูลสดตอนนี้</button>
   </div>
 </header>
 <div class="container">
@@ -82,6 +83,8 @@ th { color:var(--muted); font-weight:normal; }
     ขอบเขต: เฉพาะ 37 สถานีของ Synnex Thailand ที่บัญชี API นี้เข้าถึงได้ — ยังไม่รวม shared plants (~30 สถานีที่เหลือจากทั้งหมด 67)<br>
     ข้อจำกัดของ API: ข้อมูลระดับ PV string (PV1-8) แบบย้อนหลังรายวันไม่มีให้ผ่าน Northbound API — มีเฉพาะค่าปัจจุบัน (real-time) เท่านั้น ส่วนย้อนหลัง 10 วันระดับ string ใช้ค่า performance ของแต่ละ inverter แทน ส่วน PV1/PV2 ด้านล่างเป็นกราฟรายชั่วโมงของวันนี้ (รีเซ็ตทุกเที่ยงคืน)
   </div>
+
+  <div id="liveSnapshotBox" style="display:none"></div>
 
   <div class="summary" id="summaryCards"></div>
 
@@ -157,6 +160,53 @@ const grid = document.getElementById('plantGrid');
 const charts = {};
 
 function healthLabel(h) { return h===3 ? '<span class="badge badge-good">ปกติ</span>' : `<span class="badge badge-bad">${h===1?'Disconnected':h===2?'Faulty':'ไม่ทราบ'}</span>`; }
+
+const LIVE_WORKER_URL = 'https://cool-shape-02f2.yosynnex.workers.dev/';
+
+function plantNameByCode(code) {
+  const p = plants.find(x => x.plantCode === code);
+  return p ? p.plantName : code;
+}
+
+async function fetchLiveSnapshot() {
+  const btn = document.getElementById('liveBtn');
+  const box = document.getElementById('liveSnapshotBox');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ กำลังดึงข้อมูลสด...';
+  box.style.display = 'block';
+  box.className = 'note-box';
+  box.innerHTML = 'กำลังเชื่อมต่อ Huawei FusionSolar สด ผ่าน Cloudflare Worker...';
+  try {
+    const resp = await fetch(LIVE_WORKER_URL, { cache: 'no-store' });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    const rows = data.plants.map(p =>
+      `<tr><td>${plantNameByCode(p.plantCode)}</td><td>${healthLabel(p.health_state)}</td>` +
+      `<td>${fmt(p.power_now_kw,2)} kW</td><td>${fmt(p.day_energy_kwh,1)} kWh</td></tr>`
+    );
+    let alarmRows = (data.alarms || []).slice(0, 20).map(a =>
+      `<tr><td>${plantNameByCode(a.stationCode)}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${a.raiseTime||''}</td><td>${a.status||''}</td></tr>`
+    ).join('');
+    box.innerHTML = `
+      <b>&#9889; ข้อมูลสด ณ ${new Date(data.fetched_at).toLocaleString('th-TH', {timeZone:'Asia/Bangkok'})}</b>
+      <div style="margin-top:10px; max-height:260px; overflow:auto;">
+        <table><thead><tr><th>สถานี</th><th>สถานะ</th><th>กำลังผลิตตอนนี้</th><th>พลังงานวันนี้</th></tr></thead>
+        <tbody>${rows.join('')}</tbody></table>
+      </div>
+      <div style="margin-top:14px;"><b>แจ้งเตือนล่าสุด (24 ชม.)</b></div>
+      <div style="margin-top:6px; max-height:200px; overflow:auto;">
+        ${alarmRows ? `<table><thead><tr><th>สถานี</th><th>Alarm</th><th>ระดับ</th><th>เวลา</th><th>สถานะ</th></tr></thead><tbody>${alarmRows}</tbody></table>` : '<span class="small-muted">ไม่มีแจ้งเตือนใน 24 ชม.ที่ผ่านมา</span>'}
+      </div>
+      <div class="small-muted" style="margin-top:10px;">ข้อมูลนี้ดึงสดตรงจาก Huawei (ผ่าน Cloudflare Worker) เฉพาะกำลังผลิต/พลังงานวันนี้/แจ้งเตือน — กราฟย้อนหลังและ PV1/PV2 ยังคงมาจากรอบรีเฟรชปกติ</div>
+    `;
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--bad)">ดึงข้อมูลสดไม่สำเร็จ: ${String(e.message||e)}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
 
 function batteryChipText(eq) {
   if (!eq.has_battery) return '';
