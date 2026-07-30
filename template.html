@@ -208,14 +208,26 @@ async function fetchLiveSnapshot() {
   }
 }
 
+// 5-tier SOC color coding: 0-5% red, 6-40% orange, 41-70% yellow,
+// 71-90% green, 91-100% blue.
+function socColor(soc) {
+  if (soc===null || soc===undefined || isNaN(soc)) return 'var(--muted)';
+  if (soc <= 5) return '#e74c3c';
+  if (soc <= 40) return '#e67e22';
+  if (soc <= 70) return '#f1c40f';
+  if (soc <= 90) return '#2ecc71';
+  return '#3498db';
+}
 function batteryChipText(eq) {
   if (!eq.has_battery) return '';
-  const soc = (eq.battery_soc_pct!==null && eq.battery_soc_pct!==undefined) ? ` · SOC ${fmt(eq.battery_soc_pct,0)}%` : '';
+  const v = eq.battery_soc_pct;
+  const soc = (v!==null && v!==undefined) ? ` · SOC <span style="color:${socColor(v)};font-weight:bold">${fmt(v,0)}%</span>` : '';
   return `${eq.battery_pack_count} ก้อน${soc}`;
 }
 function batteryDetailText(eq) {
   if (!eq.has_battery) return 'ไม่มี';
-  const soc = (eq.battery_soc_pct!==null && eq.battery_soc_pct!==undefined) ? fmt(eq.battery_soc_pct,0)+'%' : '-';
+  const v = eq.battery_soc_pct;
+  const soc = (v!==null && v!==undefined) ? `<span style="color:${socColor(v)};font-weight:bold">${fmt(v,0)}%</span>` : '-';
   return `${eq.battery_pack_count} ก้อน (${eq.battery_model||'-'}) — SOC ปัจจุบัน: ${soc}`;
 }
 
