@@ -145,13 +145,33 @@ plants.forEach(p => {
 });
 attnBox.innerHTML = attnHtml || '<div class="note-box">ไม่พบความผิดปกติที่เด่นชัดในช่วง 10 วันที่ผ่านมา</div>';
 
+// raiseTime/clearedTime from Huawei's alarm API are epoch-ms, same
+// convention as collectTime elsewhere in this API — format for display.
+function fmtAlarmTime(ms) {
+  if (!ms) return '-';
+  try { return new Date(Number(ms)).toLocaleString('th-TH', {timeZone:'Asia/Bangkok'}); }
+  catch (e) { return String(ms); }
+}
+
+// Per-site alarm view: current + last 3 days, recomputed against the
+// browser's real clock each time the page loads (not the refresh time),
+// so "3 days ago" always means 3 days before whoever is looking right now.
+// Limited to the same 5-day window the backend already fetches globally.
+const ALARM_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+function plantAlarms(code) {
+  const cutoff = Date.now() - ALARM_WINDOW_MS;
+  return (DATA.alarms_5day || [])
+    .filter(a => a.stationCode === code && Number(a.raiseTime) >= cutoff)
+    .sort((a, b) => Number(b.raiseTime) - Number(a.raiseTime));
+}
+
 const alarmsBox = document.getElementById('alarmsBox');
 if (DATA.alarms_5day.length === 0) {
   alarmsBox.innerHTML = 'ไม่พบ alarm ใดๆ สำหรับทั้ง 37 สถานี ในช่วง 5 วันที่ผ่านมา';
 } else {
   let t = '<table><tr><th>สถานี</th><th>ชื่อ Alarm</th><th>ระดับ</th><th>เวลาที่เกิด</th><th>สถานะ</th></tr>';
   DATA.alarms_5day.forEach(a => {
-    t += `<tr><td>${a.stationName||a.stationCode||''}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${a.raiseTime||''}</td><td>${a.status||''}</td></tr>`;
+    t += `<tr><td>${a.stationName||a.stationCode||''}</td><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${fmtAlarmTime(a.raiseTime)}</td><td>${a.status||''}</td></tr>`;
   });
   t += '</table>';
   alarmsBox.innerHTML = t;
@@ -257,8 +277,28 @@ function pvCompareHtml(inv) {
     </div>`;
 }
 
+function alarmsBlockHtml(alarms) {
+  if (!alarms.length) {
+    return `
+      <div class="inv-block">
+        <div class="inv-title">&#128276; แจ้งเตือน (ปัจจุบัน + ย้อนหลัง 3 วัน)</div>
+        <div class="small-muted" style="color:var(--good)">ไม่มีแจ้งเตือนในช่วงนี้</div>
+      </div>`;
+  }
+  const rows = alarms.map(a => `<tr><td>${a.alarmName||''}</td><td>${a.lev||''}</td><td>${fmtAlarmTime(a.raiseTime)}</td><td>${a.status||''}</td></tr>`).join('');
+  return `
+    <div class="inv-block">
+      <div class="inv-title" style="color:var(--bad)">&#128276; แจ้งเตือน (ปัจจุบัน + ย้อนหลัง 3 วัน) — ${alarms.length} รายการ</div>
+      <table>
+        <tr><th>ชื่อ Alarm</th><th>ระดับ</th><th>เวลาที่เกิด</th><th>สถานะ</th></tr>
+        ${rows}
+      </table>
+    </div>`;
+}
+
 function cardHtml(p) {
   const wIcon = ICONS[p.today_weather_symbol] || ICONS['?'];
+  const pAlarms = plantAlarms(p.plantCode);
   return `
     <div class="plant-card" data-code="${p.plantCode}" data-name="${(p.plantName+p.plantCode).toLowerCase()}" data-health="${p.health_state===3?'ok':'bad'}" data-anom="${(p.anomalies&&p.anomalies.length)?'anom':''}">
       <div class="plant-head" onclick="toggleCard('${p.plantCode}')">
@@ -270,6 +310,7 @@ function cardHtml(p) {
             ${p.equipment.has_battery?`<span class="eq-chip">Battery ${batteryChipText(p.equipment)}</span>`:''}
             ${p.equipment.has_smartguard?`<span class="eq-chip">Smart Guard</span>`:''}
           </div>
+          ${pAlarms.length?`<span class="anom-tag" style="background:rgba(231,76,60,.15);color:var(--bad)">&#128276; ${pAlarms.length} แจ้งเตือน (3 วัน)</span>`:''}
           ${(p.anomalies&&p.anomalies.length)?`<span class="anom-tag">${p.anomalies.length} จุดควรตรวจสอบ</span>`:''}
         </div>
         <div style="text-align:right">
@@ -286,6 +327,8 @@ function cardHtml(p) {
           <div><span>พลังงานเดือนนี้</span>${fmt(p.month_energy_kwh,1)} kWh</div>
         </div>
         <div class="small-muted">เชื่อมกริด: ${(p.gridConnectionDate||'').substring(0,10)}</div>
+
+        ${alarmsBlockHtml(pAlarms)}
 
         <div class="inv-title" style="margin-top:14px">&#128268; อุปกรณ์ที่ติดตั้ง</div>
         <div class="eq-grid">
@@ -346,9 +389,11 @@ function destroyAllCharts() {
   Object.keys(charts).forEach(k => delete charts[k]);
 }
 
+// --- sorting: grid-connection-date descending, with any flagged (unhealthy
+// or has an active "needs attention" item) plant always pinned to the top ---
 let sortedPlants = [];
 function sortPlants() {
-  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0);
+  const flagged = p => (p.health_state !== 3) || (p.anomalies && p.anomalies.length > 0) || (plantAlarms(p.plantCode).length > 0);
   sortedPlants = plants.slice().sort((a, b) => {
     const af = flagged(a) ? 1 : 0, bf = flagged(b) ? 1 : 0;
     if (af !== bf) return bf - af;
@@ -357,6 +402,10 @@ function sortPlants() {
   });
 }
 
+// --- fixed 4-column layout: each plant is bucketed by inverter capacity tier
+// (3/5kW = "small" vs 10kW = "large") crossed with equipment tier (battery+
+// Smartguard = "full" vs bare/optimizer-only), regardless of phase (1P/3P
+// live in the same column). Each card toggles independently by plantCode. ---
 let openCodes = new Set();
 
 const COL_TITLES = [
