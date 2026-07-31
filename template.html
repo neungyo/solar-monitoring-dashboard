@@ -96,7 +96,11 @@ th { color:var(--muted); font-weight:normal; }
   <div class="section-title">&#128276; Alarms (5 วันล่าสุด)</div>
   <div id="alarmsBox" class="note-box"></div>
 
-  <div class="section-title">&#128267; สถานะการชาร์จแบตวันนี้</div>
+  <div class="section-title">&#128267; สถานะการชาร์จแบต</div>
+  <div class="controls" style="align-items:center;">
+    <label class="small-muted" style="margin-right:2px;">เลือกวันที่:</label>
+    <select id="battDateSelect"></select>
+  </div>
   <div id="battChargeBox" class="note-box"></div>
 
   <div class="section-title">&#127981;&#65039; รายชื่อสถานี (37 — Synnex Thailand)</div>
@@ -180,63 +184,101 @@ if (DATA.alarms_5day.length === 0) {
   alarmsBox.innerHTML = t;
 }
 
-// Battery charging status: uses the intraday SOC curve (see
-// battery_soc_trend_today, one point per hourly refresh — the Northbound
-// API has no historical SOC endpoint, so this is accumulated ourselves,
-// same mechanism as the PV1/PV2 curve). A site counts as "charged full
-// today" if any recorded point reaches >=99% SOC; otherwise its highest
-// recorded point today is shown as "not yet full". The possible-cause
-// column is a heuristic based on today's weather label and whether the
-// site's self-consumption (day_use_kwh) exceeds what it actually
-// generated (day_energy_kwh) — not a certain diagnosis.
-function socTrendOf(p) {
-  return (p.equipment && p.equipment.battery_soc_trend_today) || [];
+// Battery charging status: uses the intraday SOC curve, kept per calendar
+// day for a rolling ~10 days (see battery_soc_trend_history, one point per
+// hourly refresh — the Northbound API has no historical SOC endpoint, so
+// this is accumulated ourselves, same mechanism as the PV1/PV2 curve). A
+// site counts as "charged full" on a given day if any recorded point that
+// day reaches >=99% SOC; otherwise its highest recorded point that day is
+// shown as "not yet full". The date picker defaults to the most recent day
+// with data. The possible-cause column is a heuristic based on that day's
+// weather label (from trend_10d) and — for the latest/today entry only,
+// since it's the one day we have live self-consumption figures for —
+// whether day_use_kwh exceeds day_energy_kwh. Not a certain diagnosis.
+const todayStr = (DATA.generated_at || '').slice(0, 10);
+function socHistoryOf(p) {
+  return (p.equipment && p.equipment.battery_soc_trend_history) || {};
 }
-function chargeCauseGuess(p) {
+function socTrendForDate(p, dateStr) {
+  return socHistoryOf(p)[dateStr] || [];
+}
+function battAvailableDates() {
+  const set = new Set();
+  plants.forEach(p => {
+    Object.keys(socHistoryOf(p)).forEach(d => set.add(d));
+  });
+  if (!set.size) set.add(todayStr);
+  return Array.from(set).sort().reverse(); // most recent first
+}
+function fmtDateTh(d) {
+  try {
+    const dt = new Date(d + 'T00:00:00+07:00');
+    const label = dt.toLocaleDateString('th-TH', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Bangkok' });
+    return d === todayStr ? `${label} (ล่าสุด)` : label;
+  } catch (e) { return d; }
+}
+function weatherLabelForDate(p, dateStr) {
+  const t = (p.trend_10d || []).find(x => x.date === dateStr);
+  if (t && t.weather_label) return t.weather_label;
+  return dateStr === todayStr ? (p.today_weather_label || '') : '';
+}
+function chargeCauseGuess(p, dateStr) {
   const causes = [];
-  const wx = p.today_weather_label || '';
+  const wx = weatherLabelForDate(p, dateStr);
   if (/ฝน|พายุ|ฟ้าคะนอง|เมฆมาก/.test(wx)) causes.push(`สภาพอากาศไม่เอื้ออำนวย (${wx})`);
-  if (p.day_use_kwh != null && p.day_energy_kwh != null && p.day_use_kwh > p.day_energy_kwh) {
+  if (dateStr === todayStr && p.day_use_kwh != null && p.day_energy_kwh != null && p.day_use_kwh > p.day_energy_kwh) {
     causes.push(`ใช้ไฟสูงกว่าที่ผลิตได้ (ใช้ ${fmt(p.day_use_kwh,1)} กับผลิต ${fmt(p.day_energy_kwh,1)} kWh)`);
   }
-  if (p.anomalies && p.anomalies.length) causes.push('ระบบมีความผิดปกติ');
+  const dayAnoms = (p.anomalies || []).filter(a => a.date === dateStr);
+  if (dayAnoms.length) causes.push('ระบบมีความผิดปกติ');
   return causes.length ? causes.join(' + ') : 'ยังไม่มีข้อมูลเพียงพอจะระบุสาเหตุชัดเจน';
 }
-function renderBattChargeSummary() {
+function renderBattChargeSummary(dateStr) {
+  if (!dateStr) dateStr = todayStr;
   const box = document.getElementById('battChargeBox');
   const battPlants = plants.filter(p => p.equipment && p.equipment.has_battery);
   if (!battPlants.length) { box.innerHTML = 'ไม่มีสถานีที่ติดตั้ง Battery'; return; }
   const rows = battPlants.map(p => {
-    const trend = socTrendOf(p);
+    const trend = socTrendForDate(p, dateStr);
     const maxPoint = trend.reduce((m, e) => (m === null || e.soc > m.soc) ? e : m, null);
     const fullPoint = trend.find(e => e.soc >= 99);
     return { p, trend, maxPoint, fullPoint };
   });
-  const fullyCharged = rows.filter(r => r.fullPoint);
-  const notFull = rows.filter(r => !r.fullPoint);
-  let html = `<div style="margin-bottom:10px;"><b style="color:var(--good)">${fullyCharged.length}</b> จาก <b>${battPlants.length}</b> สถานีที่มี Battery ชาร์จเต็ม (&ge;99%) ในข้อมูลวันนี้ที่มี &middot; <b style="color:var(--bad)">${notFull.length}</b> สถานียังไม่เต็ม</div>`;
+  const withData = rows.filter(r => r.trend.length > 0);
+  const noData = rows.filter(r => r.trend.length === 0);
+  const fullyCharged = withData.filter(r => r.fullPoint);
+  const notFull = withData.filter(r => !r.fullPoint);
+  let html = `<div style="margin-bottom:10px;"><b style="color:var(--good)">${fullyCharged.length}</b> จาก <b>${withData.length}</b> สถานีที่มี Battery ชาร์จเต็ม (&ge;99%) ในข้อมูลของวันที่เลือก &middot; <b style="color:var(--bad)">${notFull.length}</b> สถานียังไม่เต็ม</div>`;
   if (notFull.length) {
-    html += '<div class="small-muted" style="margin-bottom:4px;">สถานีที่ยังไม่เต็ม (SOC สูงสุดที่พบวันนี้):</div>';
-    html += '<table><tr><th>สถานี</th><th>SOC สูงสุดวันนี้</th><th>เวลา</th><th>สาเหตุที่เป็นไปได้ (ประมาณการ)</th></tr>';
+    html += '<div class="small-muted" style="margin-bottom:4px;">สถานีที่ยังไม่เต็ม (SOC สูงสุดที่พบวันนั้น):</div>';
+    html += '<table><tr><th>สถานี</th><th>SOC สูงสุด</th><th>เวลา</th><th>สาเหตุที่เป็นไปได้ (ประมาณการ)</th></tr>';
     notFull.forEach(r => {
       const soc = r.maxPoint ? r.maxPoint.soc : r.p.equipment.battery_soc_pct;
       const time = r.maxPoint ? r.maxPoint.time : '-';
-      html += `<tr><td>${r.p.plantName}</td><td style="color:${socColor(soc)};font-weight:bold">${fmt(soc,0)}%</td><td>${time}</td><td>${chargeCauseGuess(r.p)}</td></tr>`;
+      html += `<tr><td>${r.p.plantName}</td><td style="color:${socColor(soc)};font-weight:bold">${fmt(soc,0)}%</td><td>${time}</td><td>${chargeCauseGuess(r.p, dateStr)}</td></tr>`;
     });
     html += '</table>';
   }
   if (fullyCharged.length) {
-    html += '<div class="small-muted" style="margin:10px 0 4px;">สถานีที่ชาร์จเต็มวันนี้ (เวลาที่ถึง 99%+ ครั้งแรก):</div>';
+    html += '<div class="small-muted" style="margin:10px 0 4px;">สถานีที่ชาร์จเต็มในวันนั้น (เวลาที่ถึง 99%+ ครั้งแรก):</div>';
     html += '<table><tr><th>สถานี</th><th>เวลาที่เต็ม</th></tr>';
     fullyCharged.forEach(r => {
       html += `<tr><td>${r.p.plantName}</td><td>${r.fullPoint.time}</td></tr>`;
     });
     html += '</table>';
   }
-  html += '<div class="pv-note" style="margin-top:10px;">หมายเหตุ: ระบบเพิ่งเริ่มบันทึกแนวโน้ม SOC รายชั่วโมงวันนี้ — ข้อมูล "SOC สูงสุด" และ "เวลาที่เต็ม" จะแม่นยำขึ้นเรื่อยๆ เมื่อสะสมข้อมูลผ่านไปหลายรอบรีเฟรช/หลายวัน สาเหตุที่แสดงเป็นการประมาณจากสภาพอากาศ/การใช้ไฟเทียบกับผลผลิต ไม่ใช่การวินิจฉัยที่แน่นอน</div>';
+  if (noData.length) {
+    html += `<div class="small-muted" style="margin-top:8px;">ไม่มีข้อมูล SOC ของวันที่เลือกสำหรับ ${noData.length} สถานี (ระบบยังไม่เริ่มเก็บข้อมูลช่วงนั้น หรือยังไม่มีการรีเฟรชในวันนั้น)</div>`;
+  }
+  html += '<div class="pv-note" style="margin-top:10px;">หมายเหตุ: ระบบบันทึกแนวโน้ม SOC รายชั่วโมงเอง (Northbound API ไม่มี endpoint ประวัติ SOC) และเก็บย้อนหลังไว้ล่าสุด 10 วัน — เลือกวันที่ด้านบนเพื่อดูสถานะของวันนั้น ยิ่งสะสมข้อมูลผ่านไปหลายวัน ภาพรวมจะยิ่งแม่นยำ สาเหตุที่แสดงเป็นการประมาณจากสภาพอากาศ/ความผิดปกติของระบบ (และการใช้ไฟเทียบผลผลิต เฉพาะวันล่าสุด) ไม่ใช่การวินิจฉัยที่แน่นอน</div>';
   box.innerHTML = html;
 }
-renderBattChargeSummary();
+const battDateSelect = document.getElementById('battDateSelect');
+const battDates = battAvailableDates();
+battDateSelect.innerHTML = battDates.map(d => `<option value="${d}">${fmtDateTh(d)}</option>`).join('');
+battDateSelect.value = battDates[0];
+battDateSelect.addEventListener('change', () => renderBattChargeSummary(battDateSelect.value));
+renderBattChargeSummary(battDateSelect.value);
 
 const grid = document.getElementById('plantGrid');
 const charts = {};
@@ -345,7 +387,7 @@ function pvCompareHtml(inv) {
 
 function socTrendHtml(p) {
   if (!p.equipment.has_battery) return '';
-  const trend = socTrendOf(p);
+  const trend = socTrendForDate(p, todayStr);
   if (!trend.length) return '';
   const fullPoint = trend.find(e => e.soc >= 99);
   const maxSoc = Math.max(...trend.map(e => e.soc));

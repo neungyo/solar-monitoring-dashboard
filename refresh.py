@@ -162,31 +162,47 @@ def fetch_live_state():
         print(f"WARN: could not fetch live page state ({e}); starting fresh", file=sys.stderr)
         return {}
 
-def soc_today_from_state(state, today_str):
-    """Rebuild today's intraday battery SOC readings from an already-fetched
-    live-page state dict (see fetch_live_state), same reasoning as
-    pv_today_from_state: the Northbound API has no historical battery SOC
-    endpoint (getDevRealKpi only gives the current instant), so an intraday
-    curve has to be accumulated one point per refresh run and carried
-    forward via the deployed page itself. Used to answer "did this site's
-    battery reach full charge today, and if so at what time?" and "how many
-    battery sites are not reaching full charge, and roughly why?".
+def soc_history_from_state(state, today_str):
+    """Rebuild per-day battery SOC history (rolling ~10 calendar days) from
+    an already-fetched live-page state dict (see fetch_live_state), same
+    reasoning as pv_today_from_state: the Northbound API has no historical
+    battery SOC endpoint (getDevRealKpi only gives the current instant), so
+    the curve has to be accumulated one point per refresh run and carried
+    forward via the deployed page itself.
+
+    Two source shapes are handled: the current per-day dict
+    (battery_soc_trend_history: {date: [{time, soc}, ...]}) and the older
+    single-day list (battery_soc_trend_today, from before 10-day lookback
+    was added) which is migrated in as that day's entries.
+
+    Returns: {plantCode: {date_str: [{time, soc}, ...]}}. Used to answer
+    "did this site's battery reach full charge on day X, and at what
+    time?" and "how many battery sites didn't reach full charge, and
+    roughly why?" for any of the last ~10 days, not just today.
     """
     result = {}
     for p in state.get("plants", []):
         code = p.get("plantCode")
-        entries = ((p.get("equipment") or {}).get("battery_soc_trend_today")) or []
-        todays = []
-        for e in entries:
-            if e.get("date") != today_str:
-                continue
-            soc = e.get("soc")
-            t = e.get("time")
-            if soc is None or t is None:
-                continue
-            todays.append({"time": t, "soc": soc})
-        if todays:
-            result[code] = todays
+        eq = p.get("equipment") or {}
+        hist = {}
+        new_hist = eq.get("battery_soc_trend_history")
+        if isinstance(new_hist, dict):
+            for d, entries in new_hist.items():
+                clean = [{"time": e.get("time"), "soc": e.get("soc")}
+                         for e in (entries or [])
+                         if e.get("time") is not None and e.get("soc") is not None]
+                if clean:
+                    hist[d] = clean
+        else:
+            for e in (eq.get("battery_soc_trend_today") or []):
+                d = e.get("date") or today_str
+                t = e.get("time")
+                soc = e.get("soc")
+                if t is None or soc is None:
+                    continue
+                hist.setdefault(d, []).append({"time": t, "soc": soc})
+        if hist:
+            result[code] = hist
     return result
 
 def pv_today_from_state(state, today_str):
@@ -235,7 +251,7 @@ def main():
     # below (see fetch_live_state docstring).
     live_state = fetch_live_state()
     pv_today = pv_today_from_state(live_state, today_str)
-    soc_today = soc_today_from_state(live_state, today_str)
+    soc_history = soc_history_from_state(live_state, today_str)
     live_plants_by_code = {p["plantCode"]: p for p in live_state.get("plants", [])}
 
     hist_ts_str = live_state.get("historical_refreshed_at")
@@ -484,18 +500,24 @@ def main():
             battery_pack_count = len(batteries)  # fallback if unit_info wasn't reported
         battery_soc_pct = round(sum(battery_soc_vals) / len(battery_soc_vals), 1) if battery_soc_vals else None
 
-        # Intraday SOC curve: one point per refresh run (collapsed to at most
-        # one per hour), reseeded from the deployed page and reset at local
-        # midnight — same mechanism as pv_trend_today above, since the
-        # Northbound API has no historical battery SOC endpoint either. Lets
-        # the dashboard answer "did the battery reach full charge today, and
-        # when?" without needing to store anything outside the page itself.
-        soc_trend_today = []
+        # Intraday SOC curve, kept for a rolling ~10 calendar days: one point
+        # per refresh run (collapsed to at most one per hour), reseeded from
+        # the deployed page — same mechanism as pv_trend_today above, since
+        # the Northbound API has no historical battery SOC endpoint either.
+        # Lets the dashboard answer "did the battery reach full charge on
+        # day X, and when?" and "how many days back can I check?" without
+        # needing to store anything outside the page itself.
+        soc_hist_for_plant = soc_history.setdefault(code, {})
         if batteries and battery_soc_pct is not None:
-            entries = soc_today.setdefault(code, [])
-            if not entries or entries[-1]["time"][:2] != now_hhmm[:2]:
-                entries.append({"time": now_hhmm, "soc": battery_soc_pct})
-            soc_trend_today = [{"date": today_str, "time": e["time"], "soc": e["soc"]} for e in entries]
+            today_entries = soc_hist_for_plant.get(today_str, [])
+            if not today_entries or today_entries[-1]["time"][:2] != now_hhmm[:2]:
+                today_entries.append({"time": now_hhmm, "soc": battery_soc_pct})
+            soc_hist_for_plant[today_str] = today_entries
+            if len(soc_hist_for_plant) > 10:
+                for d in sorted(soc_hist_for_plant.keys())[:-10]:
+                    del soc_hist_for_plant[d]
+        soc_trend_today = [{"date": today_str, "time": e["time"], "soc": e["soc"]}
+                            for e in soc_hist_for_plant.get(today_str, [])]
 
         equipment = {
             "inverter_count": len(inverters),
@@ -507,6 +529,7 @@ def main():
             "battery_model": battery_model,
             "battery_soc_pct": battery_soc_pct,
             "battery_soc_trend_today": soc_trend_today,
+            "battery_soc_trend_history": soc_hist_for_plant,
             "has_smartguard": len(smartguards) > 0,
             "meter_count": len(meters),
         }
