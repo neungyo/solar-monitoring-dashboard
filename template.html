@@ -96,6 +96,9 @@ th { color:var(--muted); font-weight:normal; }
   <div class="section-title">&#128276; Alarms (5 วันล่าสุด)</div>
   <div id="alarmsBox" class="note-box"></div>
 
+  <div class="section-title">&#128267; สถานะการชาร์จแบตวันนี้</div>
+  <div id="battChargeBox" class="note-box"></div>
+
   <div class="section-title">&#127981;&#65039; รายชื่อสถานี (37 — Synnex Thailand)</div>
   <div class="controls">
     <input id="searchBox" placeholder="ค้นหา plant code...">
@@ -177,6 +180,64 @@ if (DATA.alarms_5day.length === 0) {
   alarmsBox.innerHTML = t;
 }
 
+// Battery charging status: uses the intraday SOC curve (see
+// battery_soc_trend_today, one point per hourly refresh — the Northbound
+// API has no historical SOC endpoint, so this is accumulated ourselves,
+// same mechanism as the PV1/PV2 curve). A site counts as "charged full
+// today" if any recorded point reaches >=99% SOC; otherwise its highest
+// recorded point today is shown as "not yet full". The possible-cause
+// column is a heuristic based on today's weather label and whether the
+// site's self-consumption (day_use_kwh) exceeds what it actually
+// generated (day_energy_kwh) — not a certain diagnosis.
+function socTrendOf(p) {
+  return (p.equipment && p.equipment.battery_soc_trend_today) || [];
+}
+function chargeCauseGuess(p) {
+  const causes = [];
+  const wx = p.today_weather_label || '';
+  if (/ฝน|พายุ|ฟ้าคะนอง|เมฆมาก/.test(wx)) causes.push(`สภาพอากาศไม่เอื้ออำนวย (${wx})`);
+  if (p.day_use_kwh != null && p.day_energy_kwh != null && p.day_use_kwh > p.day_energy_kwh) {
+    causes.push(`ใช้ไฟสูงกว่าที่ผลิตได้ (ใช้ ${fmt(p.day_use_kwh,1)} กับผลิต ${fmt(p.day_energy_kwh,1)} kWh)`);
+  }
+  if (p.anomalies && p.anomalies.length) causes.push('ระบบมีความผิดปกติ');
+  return causes.length ? causes.join(' + ') : 'ยังไม่มีข้อมูลเพียงพอจะระบุสาเหตุชัดเจน';
+}
+function renderBattChargeSummary() {
+  const box = document.getElementById('battChargeBox');
+  const battPlants = plants.filter(p => p.equipment && p.equipment.has_battery);
+  if (!battPlants.length) { box.innerHTML = 'ไม่มีสถานีที่ติดตั้ง Battery'; return; }
+  const rows = battPlants.map(p => {
+    const trend = socTrendOf(p);
+    const maxPoint = trend.reduce((m, e) => (m === null || e.soc > m.soc) ? e : m, null);
+    const fullPoint = trend.find(e => e.soc >= 99);
+    return { p, trend, maxPoint, fullPoint };
+  });
+  const fullyCharged = rows.filter(r => r.fullPoint);
+  const notFull = rows.filter(r => !r.fullPoint);
+  let html = `<div style="margin-bottom:10px;"><b style="color:var(--good)">${fullyCharged.length}</b> จาก <b>${battPlants.length}</b> สถานีที่มี Battery ชาร์จเต็ม (&ge;99%) ในข้อมูลวันนี้ที่มี &middot; <b style="color:var(--bad)">${notFull.length}</b> สถานียังไม่เต็ม</div>`;
+  if (notFull.length) {
+    html += '<div class="small-muted" style="margin-bottom:4px;">สถานีที่ยังไม่เต็ม (SOC สูงสุดที่พบวันนี้):</div>';
+    html += '<table><tr><th>สถานี</th><th>SOC สูงสุดวันนี้</th><th>เวลา</th><th>สาเหตุที่เป็นไปได้ (ประมาณการ)</th></tr>';
+    notFull.forEach(r => {
+      const soc = r.maxPoint ? r.maxPoint.soc : r.p.equipment.battery_soc_pct;
+      const time = r.maxPoint ? r.maxPoint.time : '-';
+      html += `<tr><td>${r.p.plantName}</td><td style="color:${socColor(soc)};font-weight:bold">${fmt(soc,0)}%</td><td>${time}</td><td>${chargeCauseGuess(r.p)}</td></tr>`;
+    });
+    html += '</table>';
+  }
+  if (fullyCharged.length) {
+    html += '<div class="small-muted" style="margin:10px 0 4px;">สถานีที่ชาร์จเต็มวันนี้ (เวลาที่ถึง 99%+ ครั้งแรก):</div>';
+    html += '<table><tr><th>สถานี</th><th>เวลาที่เต็ม</th></tr>';
+    fullyCharged.forEach(r => {
+      html += `<tr><td>${r.p.plantName}</td><td>${r.fullPoint.time}</td></tr>`;
+    });
+    html += '</table>';
+  }
+  html += '<div class="pv-note" style="margin-top:10px;">หมายเหตุ: ระบบเพิ่งเริ่มบันทึกแนวโน้ม SOC รายชั่วโมงวันนี้ — ข้อมูล "SOC สูงสุด" และ "เวลาที่เต็ม" จะแม่นยำขึ้นเรื่อยๆ เมื่อสะสมข้อมูลผ่านไปหลายรอบรีเฟรช/หลายวัน สาเหตุที่แสดงเป็นการประมาณจากสภาพอากาศ/การใช้ไฟเทียบกับผลผลิต ไม่ใช่การวินิจฉัยที่แน่นอน</div>';
+  box.innerHTML = html;
+}
+renderBattChargeSummary();
+
 const grid = document.getElementById('plantGrid');
 const charts = {};
 
@@ -252,6 +313,11 @@ function batteryDetailText(eq) {
   return `${eq.battery_pack_count} ก้อน (${eq.battery_model||'-'}) — SOC ปัจจุบัน: ${soc}`;
 }
 
+// PV1/PV2 intraday history: for each string, show voltage & current at
+// each refresh run today (roughly hourly across the day's ~8 sunlight
+// hours), resetting every local midnight — lets you catch a string
+// dropping off partway through the day (loose connector, hot/tripping
+// breaker, etc.), rather than comparing PV1 vs PV2.
 function pvHistoryTable(inv, key, label) {
   const rows = (inv.pv_trend_today && inv.pv_trend_today[key]) || [];
   if (!rows.length) return '';
@@ -274,6 +340,26 @@ function pvCompareHtml(inv) {
       <div class="small-muted" style="margin-bottom:2px;">&#9889; แรงดัน/กระแส PV1 กับ PV2 รายชั่วโมงของวันนี้</div>
       ${t1}${t2}
       <div class="pv-note">สะสมทีละจุดทุกครั้งที่รีเฟรช (Northbound API ไม่มี log ประวัติระดับ PV string ต้องสะสมเอง) — รีเซ็ตใหม่ทุกเที่ยงคืน ถ้า V หรือ A ของ PV ไหนตกฮวบระหว่างวันหรือต่ำกว่าอีกช่องผิดปกติ อาจบ่งบอกสายหลวม/breaker ร้อนหรือทริป ควรตรวจสอบ</div>
+    </div>`;
+}
+
+function socTrendHtml(p) {
+  if (!p.equipment.has_battery) return '';
+  const trend = socTrendOf(p);
+  if (!trend.length) return '';
+  const fullPoint = trend.find(e => e.soc >= 99);
+  const maxSoc = Math.max(...trend.map(e => e.soc));
+  const note = fullPoint
+    ? `<span style="color:var(--good)">ชาร์จเต็มครั้งแรกเวลา ${fullPoint.time}</span>`
+    : `<span style="color:var(--bad)">ยังไม่ถึง 99% วันนี้ (สูงสุด ${fmt(maxSoc,0)}%)</span>`;
+  return `
+    <div class="pv-compare">
+      <div class="small-muted" style="margin-bottom:2px;">&#128267; แนวโน้ม SOC วันนี้</div>
+      <table>
+        <tr><th></th>${trend.map(e=>`<th>${e.time}</th>`).join('')}</tr>
+        <tr><td>SOC</td>${trend.map(e=>`<td style="color:${socColor(e.soc)};font-weight:bold">${fmt(e.soc,0)}%</td>`).join('')}</tr>
+      </table>
+      <div class="pv-note">${note}</div>
     </div>`;
 }
 
@@ -338,6 +424,8 @@ function cardHtml(p) {
           <div class="eq-item"><div class="eq-lbl">Smart Guard</div><div class="eq-val">${p.equipment.has_smartguard?'มี':'ไม่มี'}</div></div>
           <div class="eq-item"><div class="eq-lbl">Meter</div><div class="eq-val">${p.equipment.meter_count} ตัว</div></div>
         </div>
+
+        ${socTrendHtml(p)}
 
         <div class="weather-strip">
           ${p.trend_10d.map(t=>`<div class="wchip"><div class="ic">${ICONS[t.weather_symbol]||ICONS['?']}</div>${t.date.substring(5)}<br>${t.precip_mm!==null&&t.precip_mm>0?t.precip_mm+'mm':''}</div>`).join('')}
@@ -425,7 +513,7 @@ function inverterBucket(p) {
   if (small && full) return 1;
   if (large && !full) return 2;
   if (large && full) return 3;
-  return 4;
+  return 4; // fallback for any future non-matching plant
 }
 
 function renderGrid() {
