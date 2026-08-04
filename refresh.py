@@ -9,7 +9,7 @@ index.html, and leaves it in the repo root for GitHub Pages to serve.
 Env vars required: FUSIONSOLAR_USER, FUSIONSOLAR_PASS
 Optional: FUSIONSOLAR_DOMAIN (default sg5.fusionsolar.huawei.com)
 """
-import os, sys, json, re, socket, time, urllib.request, urllib.error, http.cookiejar, datetime, statistics, copy
+import os, sys, json, re, socket, time, urllib.request, urllib.error, http.cookiejar, datetime, statistics, copy, base64
 
 # Force IPv4 resolution: some CI runners fail to resolve certain hosts over
 # IPv6 (getaddrinfo raises "No address associated with hostname"), even
@@ -593,7 +593,8 @@ def main():
     out = {"generated_at": now.isoformat(), "dates10": dates10, "plants": plants_out,
            "alarms_5day": alarms, "historical_refreshed_at": historical_refreshed_at}
     save_json("dashboard_data_public_live.json", out)
-    build_html(out)
+    html = build_html(out)
+    push_index_html_to_github(html)
 
 def build_html(data):
     data_json = json.dumps(data, ensure_ascii=False)
@@ -606,6 +607,48 @@ def build_html(data):
     html = html.replace("__DATA_JSON__", data_json).replace("__ICONS_JSON__", json.dumps(icons))
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
+    return html
+
+GITHUB_REPO = "neungyo/solar-monitoring-dashboard"
+GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/index.html"
+
+def push_index_html_to_github(html_content):
+    """Push the freshly-built index.html straight to GitHub via the Contents
+    API (PUT with the file's current sha), using a fine-grained PAT scoped
+    to just this repo (Contents: read/write) passed in via GITHUB_TOKEN.
+
+    This replaces the earlier browser-automation approach (opening a Chrome
+    tab, navigating to /upload/main, dragging the file in, clicking Commit)
+    that this task used previously — that only existed because there was no
+    token to push with. With a token, the whole refresh (Huawei fetch + page
+    build + GitHub push) runs headless in this one script, no browser tab
+    ever needs to open for a routine hourly run.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("WARN: GITHUB_TOKEN not set; skipping GitHub push (index.html written locally only)", file=sys.stderr)
+        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "solar-dashboard-refresh-script",
+    }
+    get_req = urllib.request.Request(GITHUB_API, headers=headers)
+    with urllib.request.urlopen(get_req, timeout=20) as resp:
+        current = json.loads(resp.read())
+    sha = current["sha"]
+    body = json.dumps({
+        "message": f"Automated dashboard refresh {datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "content": base64.b64encode(html_content.encode("utf-8")).decode("ascii"),
+        "sha": sha,
+        "branch": "main",
+    }).encode("utf-8")
+    put_req = urllib.request.Request(GITHUB_API, data=body, headers=headers, method="PUT")
+    with urllib.request.urlopen(put_req, timeout=30) as resp:
+        result = json.loads(resp.read())
+    commit_sha = (result.get("commit") or {}).get("sha", "?")
+    print(f"Pushed index.html to GitHub: commit {commit_sha[:7]}")
+    return commit_sha
 
 if __name__ == "__main__":
     main()
